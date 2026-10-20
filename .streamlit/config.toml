@@ -1,0 +1,20 @@
+# Streamlit settings for the Crypto Trade Screener.
+# Dark theme that is easy on the eyes on a phone.
+
+[theme]
+base = "dark"
+primaryColor = "#22c55e"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#1a1f2b"
+textColor = "#e6e6e6"
+font = "sans serif"
+
+[server]
+headless = true
+runOnSave = false
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
