@@ -11,8 +11,12 @@ Usage:
   python scanner.py [--styles Day,Swing] [--pairs BTCUSDT,ETHUSDT,...] [--collateral 100]
                     [--state /workspace/scanner/state.json] [--json] [--all] [--no-state]
 
+Scalps can use a slower entry chart: --styles Scalp --scalp-tf 15m,30m,1h scans the
+styles Scalp-15m, Scalp-30m and Scalp-1h (plain "Scalp" = the classic 5-minute scalp).
+
 A signal is NEW if the same pair + style + side was not alerted in the last
-12 hours, or if since then it went to NO-GO / the opposite side and came back.
+12 hours (Scalp-15m 2h, Scalp-30m 3h, Scalp-1h 6h, Scalp 1h), or if since then it
+went to NO-GO / the opposite side and came back.
 
 NOT FINANCIAL ADVICE.
 """
@@ -43,6 +47,16 @@ for _name in list(logging.root.manager.loggerDict):      # Streamlit sets up its
 
 DEFAULT_STATE = "/workspace/scanner/state.json"
 REALERT_HOURS = 12
+
+
+def realert_hours(style: str) -> float:
+    """Dedupe window per style: 12h for Day/Swing, shorter for scalps."""
+    if style == "Scalp":
+        return 1
+    tf = app.STYLES.get(style, {}).get("scalp_tf")
+    if tf and tf in app.SCALP_TFS:
+        return app.SCALP_TFS[tf]["realert_hours"]
+    return REALERT_HOURS
 
 
 # ---------------------------------------------------------------- state / dedupe
@@ -82,7 +96,7 @@ def find_new_signals(results: list[dict], state: dict | None, now: datetime) -> 
             recent = False
             if last:
                 try:
-                    recent = now - datetime.fromisoformat(last["time"]) < timedelta(hours=REALERT_HOURS)
+                    recent = now - datetime.fromisoformat(last["time"]) < timedelta(hours=realert_hours(r["style"]))
                 except Exception:
                     recent = False
             came_back = prev is not None and prev != status      # was NO-GO / opposite side last run
@@ -101,7 +115,7 @@ def find_new_signals(results: list[dict], state: dict | None, now: datetime) -> 
 def signal_record(r: dict) -> dict:
     side = r["status"].split()[1]
     s = r["long"] if side == "LONG" else r["short"]
-    return dict(pair=r["pair"], style=r["style"], side=side, confidence=s["confidence"],
+    return dict(pair=r["pair"], style=r["style"], side=side, entry_tf=r["primary_tf"], confidence=s["confidence"],
                 leverage=r["leverage"], collateral=r["collateral"], entry=s["entry"], stop=s["stop"],
                 target=s["target"], liquidation=s["liquidation"], rr_after_costs=s["rr_after_costs"],
                 reasons=s["reasons"], backtest_expectancy_r=s["bt_exp_r"],
@@ -133,7 +147,7 @@ def text_summary(out: dict, show_all: bool) -> str:
         L.append("")
         L.append("NEW SIGNALS")
         for s in out["new_signals"]:
-            L.append(f"• {s['pair']} {s['style']} GO {s['side']} {s['confidence']}% at {s['leverage']}x")
+            L.append(f"• {s['pair']} {s['style']} ({s['timeframe']} chart) GO {s['side']} {s['confidence']}% at {s['leverage']}x")
             L.append(f"  entry {fp(s['entry'])} · stop {fp(s['stop'])} · target {fp(s['target'])} · "
                      f"liq {fp(s['liquidation'])} · R:R {s['rr_after_costs']:.2f} after costs")
             exp = "n/a" if s["backtest_expectancy_r"] is None else f"{s['backtest_expectancy_r']:+.2f}R"
@@ -164,6 +178,8 @@ def text_summary(out: dict, show_all: bool) -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Scan many crypto pairs for confirmed GO LONG / GO SHORT signals.")
     ap.add_argument("--styles", default="Day,Swing", help="comma list of Swing, Day, Scalp (default Day,Swing)")
+    ap.add_argument("--scalp-tf", default="", help="Scalp entry chart(s): comma list of 5m,15m,30m,1h "
+                    "(used with --styles Scalp; e.g. 15m,30m,1h -> Scalp-15m, Scalp-30m, Scalp-1h)")
     ap.add_argument("--pairs", default=",".join(app.SCAN_PAIRS), help="comma list of pairs (default: 20 liquid pairs)")
     ap.add_argument("--collateral", type=float, default=100.0, help="collateral in USDT (default 100)")
     ap.add_argument("--leverage", type=float, default=None, help="leverage for every style (default: each style's own)")
@@ -175,12 +191,23 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     styles = []
+    scalp_tfs = [t.strip().lower() for t in a.scalp_tf.split(",") if t.strip()]
+    for t in scalp_tfs:
+        if t not in app.SCALP_CHOICES:
+            ap.error(f"unknown --scalp-tf {t!r} (use {', '.join(app.SCALP_CHOICES)})")
     for s in a.styles.split(","):
-        s = s.strip().title()
-        if s not in app.STYLES:
-            ap.error(f"unknown style {s!r} (use Swing, Day, Scalp)")
-        if s not in styles:
-            styles.append(s)
+        s = s.strip()
+        if not s:
+            continue
+        s = s[:1].upper() + s[1:].lower() if "-" not in s else "Scalp-" + s.split("-", 1)[1].lower()
+        expanded = [app.scalp_style(t) for t in scalp_tfs] if (s == "Scalp" and scalp_tfs) else [s]
+        for x in expanded:
+            if x not in app.STYLES:
+                ap.error(f"unknown style {x!r} (use Swing, Day, Scalp, Scalp-15m, Scalp-30m, Scalp-1h)")
+            if x not in styles:
+                styles.append(x)
+    if not styles:
+        ap.error("no styles")
     pairs = []
     for p in a.pairs.split(","):
         if not p.strip():
@@ -216,12 +243,14 @@ def main(argv=None) -> int:
         run_time_utc=now.isoformat(), run_time_local=f"{now.astimezone(app.LOCAL_TZ):%d %b %Y %H:%M} {app.LOCAL_TZ_LABEL}",
         seconds=res["seconds"], styles=styles, pairs=pairs,
         leverage={s: (a.leverage if a.leverage else app.default_leverage(s)) for s in styles}, collateral=a.collateral,
-        learning_log_entries=len(entries), dedupe=("off" if state is None else f"{REALERT_HOURS}h via {state_path}"),
+        learning_log_entries=len(entries), dedupe=("off" if state is None else
+                ", ".join(f"{s} {realert_hours(s):g}h" for s in styles) + f" via {state_path}"),
         counts=dict(pairs_scanned=len({r["pair"] for r in ok}), evaluations=len(ok),
                     go_now=sum(r["status"] != "NO-GO" for r in ok), new_signals=len(new),
                     skipped=len(res["skipped"]), failed_checks=len(res["results"]) - len(ok)),
         new_signals=[signal_record(r) for r in new],
         go_now=[f"{r['pair']} {r['style']} {r['status']} {r['best_confidence']}%" for r in ok if r["status"] != "NO-GO"],
+        entry_tf={s: app.STYLES[s]["primary"] for s in styles},
         skipped=res["skipped"], errors=res["errors"],
         top=[dict(pair=r["pair"], style=r["style"], side=r["best_side"], confidence=r["best_confidence"],
                   status=r["status"]) for r in sorted(ok, key=lambda r: -r["best_confidence"])[:10]],

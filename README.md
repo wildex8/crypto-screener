@@ -200,7 +200,32 @@ Useful options:
 - `--json`
 - `--state FILE` (sets the file used to remember what has already been alerted)
 
+**Scalps on a slower chart:** `--styles Scalp --scalp-tf 15m,30m,1h` scans three extra scalp styles, `Scalp-15m` (trend checked on 1h/4h), `Scalp-30m` (1h/4h) and `Scalp-1h` (4h/daily). They use the same Scalp rules as the 5-minute scalp: a stop at 2 x ATR but never closer than 0.35%, a 2R target, and a stop that must be bigger than the round-trip costs. Each one is backtested on its own chart: about 3 months for 15m, 6 months for 30m and 12 months for 1h. Repeat alerts are held back for 2h, 3h and 6h respectively, instead of 12h. In the app, pick **Scalp** and then the **Scalp chart** (5m, 15m, 30m or 1h).
+
 As always: **not financial advice.** A GO is a set of conditions lining up, not a promise.
+
+---
+
+## Practice trading bot (paper money)
+
+`paper_trader.py` trades every new GO signal with **pretend money**. It uses no exchange account and no keys. The aim is to see whether the signals actually make money before any real funds are involved.
+
+- **Opening trades:** each new GO the scanner alerts on becomes a paper trade of **$5,000 at 5x** (1,000 USDT collateral). It enters at the signal's price and uses the signal's stop and target. Only one trade per pair and style can be open at a time.
+- **Checking trades:** every scanner run replays the 5-minute candles (15m or 1h if 5m isn't available) since the last check, using the same free data sources as the app. A trade closes at the **stop**, the **target** or **liquidation**, whichever is reached first. If the stop and target are both inside one candle, the stop is assumed. Because the candles are replayed, nights when the scanner doesn't run are handled exactly.
+- **Maximum hold:** the same as the backtest, so the results can be compared. Swing 7 days, Day 24h, Scalp (5m) 3h, Scalp-15m 4h, Scalp-30m 8h, Scalp-1h 16h. After that the trade closes at the market price.
+- **Costs:** a 0.04% fee on entry and on exit, the style's slippage each way, and funding for every 8h held (the live rate at entry, or 0.01% per 8h). Funding is always counted as paid. A liquidation loses the whole 1,000 USDT.
+- **Learning:** every closed trade keeps a snapshot of the setup at entry: confidence, ADX, RSI, Supertrend distance, EMA alignment, how many charts agreed, backtest edge, volatility, hour (UAE) and funding. Losses also get "why" tags, such as a quick stop-out, a weak trend or trading against the bigger chart. Results are grouped (by pair + style + side, by style + side, and by style + side + setup type).
+  - A group with **5 or more** results and a negative average needs more confidence before the next trade: +5, +10 or at most +15 points.
+  - A group that is clearly losing after **8 or more** trades (-0.5R or worse on average, 30% wins or fewer) is **blocked for 14 days**. One in every 4 of its signals is still traded as a test.
+  - Groups that recover are relaxed again step by step.
+  - Every change is written to `learning_changes.txt`. The strategy itself is never changed automatically.
+  - Signals the learning skips are not sent as alerts. They are listed under `paper.learning.skipped`.
+
+```
+python paper_trader.py --summary                     # plain summary + lessons learned
+python paper_trader.py --run --scan last_run.json    # what the scanner job runs after each scan
+```
+The ledger lives in `/workspace/scanner/paper/` on Grok Bot's computer (`trades.json`, `learning.json`, with backups before every write).
 
 ---
 
@@ -210,6 +235,7 @@ As always: **not financial advice.** A GO is a set of conditions lining up, not 
 |---|---|
 | `app.py` | The whole app |
 | `scanner.py` | The multi-pair scanner (used for Grok Bot's alerts; optional on Streamlit Cloud) |
+| `paper_trader.py` | The practice (paper money) trading bot that runs after each scan |
 | `requirements.txt` | The list of parts Streamlit installs |
 | `.streamlit/config.toml` | Dark theme (optional) |
 | `README.md` | This guide |

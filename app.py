@@ -76,7 +76,7 @@ POPULAR_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSD
                  "SUIUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "INJUSDT", "TRXUSDT",
                  "PENGUUSDT", "ZECUSDT", "HYPEUSDT", "PUMPUSDT", "PEPEUSDT", "WIFUSDT", "ENAUSDT", "TAOUSDT"]
 
-INTERVAL_SECONDS = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400,
+INTERVAL_SECONDS = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400,
                     "1d": 86400, "1w": 604800}
 
 # Everything that changes between trade styles lives here.
@@ -105,6 +105,36 @@ STYLES = {
         desc="Quick trades of minutes to an hour. Uses 5-minute, 15-minute and 1-hour charts (5-15x).",
     ),
 }
+
+# Scalp on a slower entry chart. Same Scalp rules (2 x ATR stop, at least 0.35 %, 2R target,
+# Supertrend 10/2.5), with bigger charts above it for the trend check. Each one is its own
+# style key ("Scalp-15m" ...) so the scanner, paper trader and journal keep them apart.
+SCALP_TFS = {
+    "15m": dict(tfs=["15m", "1h", "4h"], hold_hours=2, max_hold_bars=16, bt_candles=8760 + 260,
+                realert_hours=2),   # ~3 months backtest, max hold 4h
+    "30m": dict(tfs=["30m", "1h", "4h"], hold_hours=4, max_hold_bars=16, bt_candles=8760 + 260,
+                realert_hours=3),   # ~6 months backtest, max hold 8h
+    "1h": dict(tfs=["1h", "4h", "1d"], hold_hours=8, max_hold_bars=16, bt_candles=8760 + 260,
+               realert_hours=6),    # 12 months backtest, max hold 16h
+}
+for _tf, _v in SCALP_TFS.items():
+    _c = dict(STYLES["Scalp"])
+    _c.update(tfs=_v["tfs"], primary=_v["tfs"][0], hold_hours=_v["hold_hours"],
+              max_hold_bars=_v["max_hold_bars"], bt_candles=_v["bt_candles"], scalp_tf=_tf,
+              desc=f"Scalp on the {_tf} chart, trend checked on {_v['tfs'][1]} and {_v['tfs'][2]} (5-15x).")
+    STYLES[f"Scalp-{_tf}"] = _c
+STYLES["Scalp"]["scalp_tf"] = "5m"
+MAIN_STYLES = ["Swing", "Day", "Scalp"]          # what the style picker shows
+SCALP_CHOICES = ["5m"] + list(SCALP_TFS)          # Scalp entry chart picker ("5m" = the classic Scalp)
+
+
+def scalp_style(tf: str) -> str:
+    """'5m' -> 'Scalp', '15m' -> 'Scalp-15m'."""
+    return "Scalp" if tf in ("5m", "", None) else f"Scalp-{tf}"
+
+
+def base_style(style: str) -> str:
+    return "Scalp" if style.startswith("Scalp") else style
 
 HISTORY_TTL = 3600             # long backtest history is downloaded at most once an hour ...
 LIVE_TTL = 60                  # ... and topped up with the fresh live candles (cached 60 seconds)
@@ -179,7 +209,7 @@ def _binance_fetch(base_url):
 
 
 def _bybit_fetch(sym, iv, limit, end_ms):
-    ivmap = {"5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D", "1w": "W"}
+    ivmap = {"5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240", "1d": "D", "1w": "W"}
     params = {"category": "spot", "symbol": sym, "interval": ivmap[iv], "limit": min(limit, 1000)}
     if end_ms:
         params["end"] = end_ms
@@ -191,7 +221,7 @@ def _bybit_fetch(sym, iv, limit, end_ms):
 
 
 def _okx_fetch(sym, iv, limit, end_ms):
-    ivmap = {"5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1Dutc", "1w": "1Wutc"}
+    ivmap = {"5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H", "4h": "4H", "1d": "1Dutc", "1w": "1Wutc"}
     if end_ms:   # older data comes from the history endpoint, 100 per page
         url = "https://www.okx.com/api/v5/market/history-candles"
         params = {"instId": sym, "bar": ivmap[iv], "limit": min(limit, 100), "after": end_ms + 1}
@@ -206,7 +236,7 @@ def _okx_fetch(sym, iv, limit, end_ms):
 
 
 def _kucoin_fetch(sym, iv, limit, end_ms):
-    ivmap = {"5m": "5min", "15m": "15min", "1h": "1hour", "4h": "4hour", "1d": "1day", "1w": "1week"}
+    ivmap = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1hour", "4h": "4hour", "1d": "1day", "1w": "1week"}
     end_s = int((end_ms or time.time() * 1000) // 1000)
     start_s = end_s - min(limit, 1500) * INTERVAL_SECONDS[iv]
     j = _get_json("https://api.kucoin.com/api/v1/market/candles",
@@ -231,7 +261,7 @@ def _coinbase_fetch(sym, iv, limit, end_ms):
 
 
 def _kraken_fetch(sym, iv, limit, end_ms):
-    ivmap = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080}
+    ivmap = {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080}
     if end_ms:              # Kraken only serves the latest 720 candles
         return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
     j = _get_json("https://api.kraken.com/0/public/OHLC", {"pair": sym, "interval": ivmap[iv]})
@@ -271,7 +301,7 @@ SOURCES = [
 ]
 
 # If a source lacks an interval we build it from a smaller one.
-RESAMPLE_FROM = {"4h": ("1h", 4, "4h"), "1w": ("1d", 7, "W-MON")}
+RESAMPLE_FROM = {"30m": ("15m", 2, "30min"), "4h": ("1h", 4, "4h"), "1w": ("1d", 7, "W-MON")}
 
 
 def _resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -909,6 +939,10 @@ def decide(mtf: dict, style: str, leverage: float, position: dict, bt: dict | No
     elif position["liq_close"]:
         conf *= 0.85
         reasons.append(f"⚠️ Liquidation is close to the stop. Safer: {position['max_safe_lev']}x or less.")
+    round_trip = 2 * (TAKER_FEE + cfg["slippage"])
+    if position["stop_pct"] <= round_trip:
+        blockers.append(f"The stop ({position['stop_pct'] * 100:.2f}%) is not bigger than the round-trip "
+                        f"costs ({round_trip * 100:.2f}%).")
     if position["rr_after_costs"] < 1.0:
         blockers.append(f"After costs the reward is smaller than the risk (R:R {position['rr_after_costs']:.2f}).")
 
@@ -1567,12 +1601,16 @@ def settings_card():
                                   index=POPULAR_PAIRS.index(ss.cfg_pair) if in_list else len(POPULAR_PAIRS))
             custom = c2.text_input("Or type a pair", value="" if in_list else ss.cfg_pair,
                                    placeholder="e.g. PEPEUSDT")
-            style = seg("Trade style", list(STYLES), ss.cfg_style)
+            style = seg("Trade style", MAIN_STYLES, base_style(ss.cfg_style))
+            cur_tf = STYLES[ss.cfg_style].get("scalp_tf", "5m") if ss.cfg_style.startswith("Scalp") else "5m"
+            scalp_tf = seg("Scalp chart", SCALP_CHOICES, cur_tf, key="scalp_tf",
+                           help="Only used for Scalp: the candle size you enter on. "
+                                "15m checks the trend on 1h/4h, 30m on 1h/4h, 1h on 4h/daily.")
             collateral = st.number_input("Collateral (USDT)", min_value=1.0, max_value=10_000_000.0,
                                          value=float(ss.cfg_collateral), step=10.0)
             leverage = st.slider("Leverage", 1, 25, int(ss.cfg_leverage))
             st.caption("Suggested: " + " · ".join(f"{k} {v['lev_range'][0]}-{v['lev_range'][1]}x"
-                                                  for k, v in STYLES.items()))
+                                                  for k, v in STYLES.items() if k in MAIN_STYLES))
             with st.expander("Advanced: Supertrend"):
                 custom_st = st.checkbox("Use my own Supertrend settings", value=ss.cfg_custom_st)
                 c3, c4 = st.columns(2)
@@ -1587,6 +1625,8 @@ def settings_card():
                     ss.cfg_pair = base + quote
                 except DataError as e:
                     st.error(f"{e} Keeping {ss.cfg_pair}.")
+                if style == "Scalp":
+                    style = scalp_style(scalp_tf)
                 ss.cfg_style, ss.cfg_collateral, ss.cfg_leverage = style, float(collateral), int(leverage)
                 ss.cfg_custom_st, ss.cfg_st_period, ss.cfg_st_mult = custom_st, int(st_period), float(st_mult)
                 ss.settings_used = True
@@ -1797,7 +1837,7 @@ def render_backtest(res, style, leverage):
     html(f'<div class="note">The {style} rules on {cfg["primary"]} candles, '
          f'{bt["start"].tz_convert(LOCAL_TZ):%d %b %Y} – {bt["end"].tz_convert(LOCAL_TZ):%d %b %Y} '
          f'(~{bt["days"]:.0f} days, {bt["n_candles"]:,} candles) at {leverage}x with fees, slippage and funding.'
-         + (" Scalp tests only the latest few weeks to stay quick." if style == "Scalp" else "") + "</div>")
+         + (f" {style} tests only the latest {history_label(style)} to stay quick." if style.startswith("Scalp") and history_label(style) != "12 months" else "") + "</div>")
     exp_col = IOS["green"] if bt["exp_r"] > 0 and bt["exp_pct"] > 0 else IOS["red"]
     tiles([
         ("Trades", str(bt["n"]), f"{bt['long_n']} long · {bt['short_n']} short"),
