@@ -166,6 +166,7 @@ def main(argv=None) -> int:
     ap.add_argument("--styles", default="Day,Swing", help="comma list of Swing, Day, Scalp (default Day,Swing)")
     ap.add_argument("--pairs", default=",".join(app.SCAN_PAIRS), help="comma list of pairs (default: 20 liquid pairs)")
     ap.add_argument("--collateral", type=float, default=100.0, help="collateral in USDT (default 100)")
+    ap.add_argument("--leverage", type=float, default=None, help="leverage for every style (default: each style's own)")
     ap.add_argument("--state", default=DEFAULT_STATE, help=f"state file for dedupe (default {DEFAULT_STATE})")
     ap.add_argument("--json", action="store_true", help="print JSON instead of text")
     ap.add_argument("--all", action="store_true", help="also show every pair's long/short confidence")
@@ -200,7 +201,7 @@ def main(argv=None) -> int:
     state = None if a.no_state else load_state(state_path)
     now = datetime.now(timezone.utc)
 
-    res = app.scan_pairs(pairs, styles, a.collateral, entries, workers=a.workers,
+    res = app.scan_pairs(pairs, styles, a.collateral, entries, workers=a.workers, leverage=a.leverage,
                          progress=lambda d, n: print(f"  scanned {d}/{n}", file=sys.stderr) if not a.json else None)
     new = find_new_signals(res["results"], state, now)
     if state is not None:
@@ -214,7 +215,7 @@ def main(argv=None) -> int:
     out = dict(
         run_time_utc=now.isoformat(), run_time_local=f"{now.astimezone(app.LOCAL_TZ):%d %b %Y %H:%M} {app.LOCAL_TZ_LABEL}",
         seconds=res["seconds"], styles=styles, pairs=pairs,
-        leverage={s: app.default_leverage(s) for s in styles}, collateral=a.collateral,
+        leverage={s: (a.leverage if a.leverage else app.default_leverage(s)) for s in styles}, collateral=a.collateral,
         learning_log_entries=len(entries), dedupe=("off" if state is None else f"{REALERT_HOURS}h via {state_path}"),
         counts=dict(pairs_scanned=len({r["pair"] for r in ok}), evaluations=len(ok),
                     go_now=sum(r["status"] != "NO-GO" for r in ok), new_signals=len(new),

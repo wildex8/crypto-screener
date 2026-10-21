@@ -1074,7 +1074,7 @@ def _side_summary(dec: dict, pos: dict, bt: dict | None) -> dict:
 
 
 def scan_pair(pair: str, styles: list[str], collateral: float = 100.0, entries: list[dict] | None = None,
-              pause: float = 0.05) -> list[dict]:
+              pause: float = 0.05, leverage: float | None = None) -> list[dict]:
     """Scan one pair for the given styles. Never raises: failures come back as ok=False."""
     entries = entries or []
     need: dict[str, int] = {}
@@ -1107,7 +1107,7 @@ def scan_pair(pair: str, styles: list[str], collateral: float = 100.0, entries: 
 
     out = []
     for s_ in styles:
-        cfg, lev = STYLES[s_], default_leverage(s_)
+        cfg, lev = STYLES[s_], (leverage or default_leverage(s_))
         base = dict(pair=pair, style=s_, leverage=lev, collateral=collateral)
         try:
             mtf = multi_timeframe(pair, s_, cfg["st_period"], cfg["st_mult"], fetcher=fetcher)
@@ -1150,13 +1150,14 @@ def scan_pair(pair: str, styles: list[str], collateral: float = 100.0, entries: 
 
 
 def scan_pairs(pairs: list[str], styles: list[str], collateral: float = 100.0,
-               entries: list[dict] | None = None, workers: int = 4, progress=None) -> dict:
+               entries: list[dict] | None = None, workers: int = 4, progress=None,
+               leverage: float | None = None) -> dict:
     """Scan many pairs (a few at a time, to be polite to the free APIs)."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     t0 = time.time()
     results, done = [], 0
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        futs = {ex.submit(scan_pair, p, styles, collateral, entries): p for p in pairs}
+        futs = {ex.submit(scan_pair, p, styles, collateral, entries, leverage=leverage): p for p in pairs}
         for f in as_completed(futs):
             try:
                 results.extend(f.result())
