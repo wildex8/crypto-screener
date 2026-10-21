@@ -44,9 +44,9 @@ Go to **github.com** and sign in with your existing account. GitHub is where you
    - `README.md` (optional)
 3. Scroll down and tap the green **Commit changes** button.
 
-**The `.streamlit` folder (optional):** it only sets the dark colour theme. Folders whose names start with a dot are hidden on many computers and phones, so they can be hard to upload. **You can skip it, the app works fine without it.** If you'd like it: tap **Add file → Create new file**, type the name `.streamlit/config.toml` (typing the `/` makes the folder), paste in the contents of `config.toml` from the folder I gave you, then tap **Commit changes**.
+**The `.streamlit` folder (optional):** it only sets the dark, iOS-style colour theme. Folders whose names start with a dot are hidden on many computers and phones, so they can be hard to upload. **You can skip it, the app works fine without it.** If you'd like it: tap **Add file → Create new file**, type the name `.streamlit/config.toml` (typing the `/` makes the folder), paste in the contents of `config.toml` from the folder I gave you, then tap **Commit changes**.
 
-Don't upload `screenshot_mobile.png`. It's only a preview picture.
+Don't upload the `screenshot_*.png` files. They're only preview pictures.
 
 ### Step 4: Deploy on Streamlit Community Cloud
 
@@ -73,7 +73,7 @@ Don't upload `screenshot_mobile.png`. It's only a preview picture.
 ### Step 6: Good to know
 
 - **It goes to sleep.** If nobody uses it for a while, the free app sleeps. Just tap the button saying something like **"Yes, get this app back up!"** and wait about a minute.
-- **The learning log gets wiped.** On the free plan, saved results are deleted whenever the app restarts, sleeps or is updated. After logging results, tap **Download backup (CSV)** in the **Learning** tab, and use **Restore from CSV** to bring them back later.
+- **The learning log gets wiped.** On the free plan, saved results are deleted whenever the app restarts, sleeps or is updated. After logging results, tap **Download backup (CSV)** in the **Journal** tab, and use **Restore from backup** to bring them back later.
 - **Updating the app:** on GitHub, open the file (e.g. `app.py`), tap the ✏️ pencil to edit (or upload a new version), then **Commit changes**. The app updates itself within a minute or two.
 - **Logs and settings:** when you're signed in, the app page has a **Manage app** button at the bottom right. That's where you can see logs, reboot the app or change settings.
 
@@ -81,7 +81,7 @@ Don't upload `screenshot_mobile.png`. It's only a preview picture.
 
 | Problem | What to do |
 |---|---|
-| "Could not load enough data" / "data source blocked" | Streamlit's servers are in the USA, and some exchanges (Binance's main site, Bybit) block US traffic. The app tries other sources automatically (Binance's public data mirror, OKX, KuCoin, Coinbase, Kraken) and shows which one it used. If they all fail, wait a minute and tap **Refresh data**. |
+| "Could not load enough data" / "data source blocked" | Streamlit's servers are in the USA, and some exchanges (Binance's main site, Bybit) block US traffic. The app tries other sources automatically (Binance's public data mirror, OKX, KuCoin, Coinbase, Kraken) and shows which one it used. If they all fail, wait a minute and tap **Refresh prices**. |
 | "Could not load ... for XYZUSDT" | Check the pair name. Use the coin + USDT, e.g. `SOLUSDT`, `PEPEUSDT`. Very new or tiny coins may not be on the free data sources. |
 | `ModuleNotFoundError` on the deploy screen | Make sure `requirements.txt` is uploaded, sits next to `app.py` (not in a sub-folder) and is spelt exactly like that. Then use **Manage app → Reboot app**. |
 | App shows an error after you edited it | Undo your change on GitHub (open the file → History) or upload the original `app.py` again. |
@@ -116,7 +116,14 @@ Don't upload `screenshot_mobile.png`. It's only a preview picture.
 
 ## What each part of the app means
 
-**Settings (top of the page).** Tap to open. Choose the **pair**, your **collateral** (the USDT you put in), the **leverage** (1-25x) and the **trade style**. Then tap **Analyse**.
+The app is laid out like a phone app. From top to bottom:
+
+**Settings card.** The bar showing something like `BTCUSDT · Day · 100 USDT · 3x`. It's open on your first visit and folds away after you tap **Analyse**. Tap it to change:
+- the **pair**
+- the **trade style** (Swing / Day / Scalp)
+- your **collateral** (the USDT you put in)
+- the **leverage** (1-25x)
+- **Show side** (Auto / Long / Short), which switches instantly with no need to tap Analyse
 
 | Style | Charts it looks at | Typical hold | Suggested leverage |
 |---|---|---|---|
@@ -124,19 +131,21 @@ Don't upload `screenshot_mobile.png`. It's only a preview picture.
 | Day | 15-min, 1-hour, 4-hour | hours | 3-8x |
 | Scalp | 5-min, 15-min, 1-hour | minutes to an hour | 5-15x |
 
-If your leverage is outside the suggested range, you'll see a warning.
+If your leverage is outside the suggested range, an orange note appears under the settings card.
 
-**Show side (Auto / Long / Short).** A switch just under the settings.
-- **Auto (best side)**: the big banner shows whichever side, long or short, has the higher confidence. If both are NO-GO, it simply says NO-GO.
-- **Long** or **Short**: the big banner, the Position tab, the stop/target lines on the chart and the "Log a result" direction all follow the side you picked.
+**Show side.**
+- **Auto (best side)**: the big card shows whichever side, long or short, has the higher confidence. If both are NO-GO, it simply says NO-GO.
+- **Long** or **Short**: the big card, the four key numbers, the Details tab, the stop/target lines on the chart and the Journal's direction all follow the side you picked.
 
-**🎯 Decision.** The big banner, then two smaller cards, **LONG** and **SHORT**, side by side. Each side is checked separately and gets its own verdict and confidence. The side the banner is showing has a yellow outline and a ★.
+**The big decision card.** The verdict (**GO LONG**, **GO SHORT** or **NO-GO**), a ring showing the **confidence %**, and one line saying the main reason.
 - **GO LONG** means the signals point up: a bet the price rises.
 - **GO SHORT** means the signals point down: a bet the price falls.
-- **NO-GO** means don't trade that side now. The reasons are listed on its card.
+- **NO-GO** means don't trade that side now.
 - **Confidence %** shows how strongly everything agrees for that side. Under 55% is always NO-GO, and a NO-GO never shows more than 49%. Even 80% is **not** a guarantee.
 
-Usually one side looks reasonable and the other looks poor: if the charts lean up, the long side scores higher and the short side scores lower. Often both are NO-GO, which simply means "no good trade right now".
+**Long and Short cards.** Two small cards side by side, one per direction, each with its own verdict and confidence bar. They always show both sides. The one with the blue outline is the side the big card is showing. Usually one side looks reasonable and the other poor: if the charts lean up, the long side scores higher and the short side lower. Often both are NO-GO, which simply means "no good trade right now".
+
+Under the cards you'll see two more reasons. Tap **Show all reasons** for the full list for both sides. Green dots are checks that passed, red dots are what blocks a GO, orange dots are cautions, and grey dots are just information.
 
 A side can only be GO if all of these are true:
 1. the overall score clearly points its way
@@ -146,30 +155,26 @@ A side can only be GO if all of these are true:
 5. you wouldn't be liquidated before your stop
 6. the reward is bigger than the risk after costs
 
-**📊 Chart.** Candles with the **Supertrend** (green = up-trend, red = down-trend) and the EMA lines. Volume is in the middle and **RSI** at the bottom (above 70 = stretched up, below 30 = stretched down). Pinch to zoom. Times are Sri Lanka time.
+**Four key numbers.** **Entry** (price now), **Stop-loss**, **Target** and **Liquidation** for the side being shown, each with its distance from the price. A long's stop sits below the price and a short's above it. If you'd be liquidated before your stop, a red warning tells you the highest safe leverage. **Refresh prices** fetches the newest data (prices are otherwise remembered for 60 seconds).
 
-**💰 Position.** Shows the side chosen with the **Show side** switch (in Auto, the stronger side). A long's stop sits below the price and a short's above it, so the numbers change with the side.
-- Your position size (collateral × leverage) and the number of coins.
-- The suggested stop-loss and take-profit.
-- The estimated **liquidation price**: the price at which the exchange closes your trade and you lose the collateral.
-- If liquidation would come **before** your stop, you'll get a red warning and the highest **safe leverage**.
-- Costs: 0.04% fee in and out, slippage, and funding for the typical hold time.
+Below that are four tabs:
 
-**🔍 Analysis.** Every indicator on every timeframe, explained in one line each, with the points it added or took away.
+- **Chart**: candles with the **Supertrend** line (green = up-trend, red = down-trend) and the EMA lines, plus dashed lines for entry, stop and target. Volume is in the middle and **RSI** at the bottom (above 70 = stretched up, below 30 = stretched down). Pinch to zoom. Times are Sri Lanka time.
+- **Details**:
+  - your position size, the max safe leverage, what you'd lose at the stop and gain at the target
+  - distances to the stop and to liquidation
+  - a clear list of costs (0.04% fee in and out, slippage, and funding for the typical hold time)
+  - **Analysis**: every indicator on every timeframe, explained in one line each
+  - **Risks & disclaimer**: the important warnings in one place
+- **Backtest**: how the same rules would have done in the past, at your leverage and with all costs included:
+  - trades and win rate
+  - **expectancy**: the average result per trade (above 0 is good)
+  - profit factor and biggest drawdown
+  - an account-value chart
+  - long trades vs short trades shown separately, because each side's decision uses only its own past trades
 
-**🧪 Backtest.** How the same rules would have done in the past, at your leverage and with all costs included. Long trades and short trades are also shown separately, because each side's decision uses only its own past trades:
-- number of trades and win rate
-- average win and loss
-- **expectancy**: the average result per trade (above 0 is good)
-- profit factor
-- biggest drawdown
-- an account-value chart
-
-Scalp tests only the last few weeks of 5-minute candles to stay quick. The exact dates tested are shown.
-
-**🧠 Learning.** Log **Win** or **Loss** after each trade, with its direction. The app shrinks confidence a little for styles, pairs and directions (long or short) that keep losing for you, and raises it slightly (up to +15%) for ones that win. Remember to **download the CSV backup**.
-
-**⚠️ Warnings.** The important risks, in one place.
+  Scalp tests only the last few weeks of 5-minute candles to stay quick. The exact dates tested are shown.
+- **Journal**: log **Win** or **Loss** after each trade, with its direction. The app shrinks confidence a little for styles, pairs and directions that keep losing for you, and raises it slightly (up to +15%) for ones that win. Tap **Download backup (CSV)** afterwards, because free Streamlit Cloud wipes the journal on restarts. Use **Restore from backup** to bring it back.
 
 ---
 
@@ -181,7 +186,7 @@ Scalp tests only the last few weeks of 5-minute candles to stay quick. The exact
 | `requirements.txt` | The list of parts Streamlit installs |
 | `.streamlit/config.toml` | Dark theme (optional) |
 | `README.md` | This guide |
-| `screenshot_mobile.png` | What it looks like on a phone (don't upload) |
+| `screenshot_*.png` | What it looks like on a phone (don't upload) |
 
 `learning_log.json` is created automatically when you log your first result.
 

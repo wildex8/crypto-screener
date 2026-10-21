@@ -1,12 +1,11 @@
-# Streamlit settings for the Crypto Trade Screener.
-# Dark theme that is easy on the eyes on a phone.
+# Streamlit settings for the Trade Screener: a clean, iOS-style dark look.
 
 [theme]
 base = "dark"
-primaryColor = "#22c55e"
-backgroundColor = "#0e1117"
-secondaryBackgroundColor = "#1a1f2b"
-textColor = "#e6e6e6"
+primaryColor = "#0A84FF"          # iOS blue - the one accent colour
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#1C1C1E"
+textColor = "#F5F5F7"
 font = "sans serif"
 
 [server]

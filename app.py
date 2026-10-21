@@ -544,7 +544,7 @@ def multi_timeframe(pair: str, style: str, st_period: int, st_mult: float, fetch
         raise DataError(
             f"Could not load enough {cfg['primary']} data for {pair.upper()}. "
             "Check the pair name (e.g. BTCUSDT) - it may not be listed on the free data sources, "
-            "or the data sources may be busy. Tap Refresh data to try again.")
+            "or the data sources may be busy. Tap Refresh prices to try again.")
     wsum = sum(r["weight"] for r in tfs.values())
     combined = sum(r["score"] * r["weight"] for r in tfs.values()) / wsum
     return dict(tfs=tfs, score=combined, problems=problems, sources=sorted(sources),
@@ -929,6 +929,25 @@ def learning_multiplier(entries: list[dict], style: str, pair: str,
 # 9. CHARTS
 # =============================================================================
 
+# Colours and chart theme shared with the iOS-style interface.
+IOS = dict(green="#34C759", red="#FF3B30", orange="#FF9500", blue="#0A84FF", yellow="#FFD60A",
+           purple="#BF5AF2", teal="#64D2FF", text="#F5F5F7", muted="#8E8E93", grid="rgba(255,255,255,0.06)")
+FONT_STACK = '-apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", Roboto, sans-serif'
+
+
+def _chart_layout(fig: go.Figure, height: int) -> None:
+    """Clean, transparent Plotly look that blends into the app."""
+    fig.update_layout(
+        template="plotly_dark", height=height, margin=dict(l=0, r=0, t=8, b=0),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family=FONT_STACK, size=11, color=IOS["muted"]),
+        hoverlabel=dict(font=dict(family=FONT_STACK)), dragmode="pan",
+    )
+    fig.update_xaxes(showgrid=False, zeroline=False, showline=False, tickfont=dict(size=10))
+    fig.update_yaxes(gridcolor=IOS["grid"], gridwidth=1, zeroline=False, showline=False,
+                     side="right", tickfont=dict(size=10))
+
+
 def to_local(ts: pd.Series) -> pd.Series:
     return ts.dt.tz_convert(LOCAL_TZ)
 
@@ -941,92 +960,162 @@ def price_chart(d: pd.DataFrame, pair: str, tf: str, pos: dict | None = None) ->
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
                         row_heights=[0.62, 0.16, 0.22])
     fig.add_trace(go.Candlestick(x=x, open=d["open"], high=d["high"], low=d["low"], close=d["close"],
-                                 name="Price", increasing_line_color="#22c55e",
-                                 decreasing_line_color="#ef4444", showlegend=False), row=1, col=1)
+                                 name="Price", increasing_line_color=IOS["green"], increasing_fillcolor=IOS["green"],
+                                 decreasing_line_color=IOS["red"], decreasing_fillcolor=IOS["red"],
+                                 line=dict(width=1), showlegend=False), row=1, col=1)
     up = d["st_line"].where(d["st_dir"] == 1)
     dn = d["st_line"].where(d["st_dir"] == -1)
     fig.add_trace(go.Scatter(x=x, y=up, mode="lines", name="Supertrend up",
-                             line=dict(color="#22c55e", width=2)), row=1, col=1)
+                             line=dict(color=IOS["green"], width=2)), row=1, col=1)
     fig.add_trace(go.Scatter(x=x, y=dn, mode="lines", name="Supertrend down",
-                             line=dict(color="#ef4444", width=2)), row=1, col=1)
-    for n, col in ((9, "#facc15"), (21, "#38bdf8"), (50, "#a78bfa"), (200, "#f97316")):
+                             line=dict(color=IOS["red"], width=2)), row=1, col=1)
+    for n, col in ((9, IOS["yellow"]), (21, IOS["teal"]), (50, IOS["purple"]), (200, IOS["orange"])):
         if d[f"ema{n}"].notna().any():
             fig.add_trace(go.Scatter(x=x, y=d[f"ema{n}"], mode="lines", name=f"EMA {n}",
-                                     line=dict(color=col, width=1)), row=1, col=1)
-    vol_col = np.where(d["close"] >= d["open"], "rgba(34,197,94,0.6)", "rgba(239,68,68,0.6)")
+                                     line=dict(color=col, width=1), opacity=0.85), row=1, col=1)
+    vol_col = np.where(d["close"] >= d["open"], "rgba(52,199,89,0.45)", "rgba(255,59,48,0.45)")
     fig.add_trace(go.Bar(x=x, y=d["volume"], marker_color=vol_col, name="Volume", showlegend=False),
                   row=2, col=1)
     fig.add_trace(go.Scatter(x=x, y=d["rsi"], mode="lines", name="RSI",
-                             line=dict(color="#e5e7eb", width=1), showlegend=False), row=3, col=1)
+                             line=dict(color=IOS["blue"], width=1.2), showlegend=False), row=3, col=1)
     for lvl in (70, 30):
-        fig.add_hline(y=lvl, line=dict(color="#6b7280", width=1, dash="dot"), row=3, col=1)
+        fig.add_hline(y=lvl, line=dict(color=IOS["muted"], width=0.8, dash="dot"), row=3, col=1)
     if pos:
         side = "LONG" if pos["direction"] == 1 else "SHORT"
         lo_vis, hi_vis = float(d["low"].min()), float(d["high"].max())
         span = hi_vis - lo_vis
-        levels = [("Entry", pos["entry"], "#e5e7eb", "dot"), ("Stop", pos["stop"], "#ef4444", "dash"),
-                  ("Target", pos["target"], "#22c55e", "dash")]
+        levels = [("Entry", pos["entry"], IOS["text"], "dot"), ("Stop", pos["stop"], IOS["red"], "dash"),
+                  ("Target", pos["target"], IOS["green"], "dash")]
         if lo_vis - span * 0.3 <= pos["liq"] <= hi_vis + span * 0.3:   # only if it won't squash the chart
-            levels.append(("Liquidation", pos["liq"], "#f97316", "dashdot"))
+            levels.append(("Liq.", pos["liq"], IOS["orange"], "dashdot"))
         for name, y, col, dash in levels:
             fig.add_hline(y=y, line=dict(color=col, width=1.2, dash=dash), row=1, col=1,
-                          annotation_text=f"{side} {name} {fmt_price(y)}", annotation_position="top left",
-                          annotation_font=dict(size=9, color=col))
+                          annotation_text=f"{name} {fmt_price(y)}", annotation_position="top left",
+                          annotation_font=dict(size=9, color=col), annotation_bgcolor="rgba(0,0,0,0.55)")
+    _chart_layout(fig, 440)
     fig.update_layout(
-        template="plotly_dark", height=580, margin=dict(l=4, r=4, t=30, b=4),
-        title=dict(text=f"{pair} · {tf} · {LOCAL_TZ_LABEL}", font=dict(size=13), x=0.01),
-        legend=dict(orientation="h", yanchor="top", y=-0.04, x=0, font=dict(size=10)),
-        xaxis_rangeslider_visible=False, dragmode="pan", hovermode="x unified",
-        paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+        xaxis_rangeslider_visible=False, hovermode="x unified", showlegend=False,
+        margin=dict(l=0, r=0, t=4, b=0),
     )
-    fig.update_yaxes(side="right", tickfont=dict(size=10))
-    fig.update_yaxes(title_text="Vol", row=2, col=1, showticklabels=False)
-    fig.update_yaxes(title_text="RSI", row=3, col=1, range=[0, 100])
+    fig.update_yaxes(showticklabels=False, row=2, col=1)
+    fig.update_yaxes(range=[0, 100], tickvals=[30, 70], row=3, col=1)
     return fig
 
 
 def equity_chart(bt: dict) -> go.Figure:
     e = bt["equity"]
+    up = e["equity"].iloc[-1] >= 100
+    col = IOS["green"] if up else IOS["red"]
+    fill = "rgba(52,199,89,0.12)" if up else "rgba(255,59,48,0.12)"
     fig = go.Figure(go.Scatter(x=to_local(pd.to_datetime(e["time"], utc=True)), y=e["equity"],
-                               mode="lines", line=dict(color="#38bdf8", width=2), name="Account"))
-    fig.add_hline(y=100, line=dict(color="#6b7280", dash="dot"))
-    fig.update_layout(template="plotly_dark", height=320, margin=dict(l=4, r=4, t=30, b=4),
-                      title=dict(text="Account value (start = 100)", font=dict(size=13), x=0.01),
-                      paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", showlegend=False)
-    fig.update_yaxes(side="right")
+                               mode="lines", line=dict(color=col, width=2), fill="tozeroy",
+                               fillcolor=fill, name="Account"))
+    fig.add_hline(y=100, line=dict(color=IOS["muted"], width=0.8, dash="dot"))
+    _chart_layout(fig, 240)
+    lo_, hi_ = float(e["equity"].min()), float(e["equity"].max())
+    pad = max((hi_ - lo_) * 0.1, 2)
+    fig.update_layout(showlegend=False)
+    fig.update_yaxes(range=[max(0, lo_ - pad), hi_ + pad])
     return fig
 
 
 # =============================================================================
-# 10. USER INTERFACE
+# 10. USER INTERFACE  (iOS-style, phone-first)
 # =============================================================================
+# The home screen is deliberately simple:
+#   header -> settings card -> big decision card -> Long / Short mini cards
+#   -> 4 key numbers -> tabs (Chart, Details, Backtest, Journal).
 
 CSS = """
 <style>
-.block-container {padding-top: 1.2rem; padding-left: 0.8rem; padding-right: 0.8rem; max-width: 820px;}
-div[data-testid="stMetricValue"] {font-size: 1.2rem;}
-div[data-testid="stMetricLabel"] p {font-size: 0.8rem;}
-.disclaimer {background:#3b0d0d; border:1px solid #ef4444; color:#fecaca; padding:8px 12px;
-             border-radius:8px; font-size:0.9rem; margin-bottom:8px;}
-.banner {border-radius:14px; padding:18px 12px; text-align:center; margin:6px 0 12px 0;}
-.banner .verdict {font-size:2.4rem; font-weight:800; letter-spacing:1px; line-height:1.1;}
-.banner .conf {font-size:1.2rem; margin-top:6px;}
-.go {background:#065f46; border:2px solid #22c55e; color:#ecfdf5;}
-.nogo {background:#7f1d1d; border:2px solid #ef4444; color:#fef2f2;}
-button[data-baseweb="tab"] {padding-left:8px; padding-right:8px;}
-.banner .sub {font-size:0.85rem; margin-top:4px; opacity:0.85;}
-.cards {display:flex; flex-wrap:wrap; gap:8px; margin:4px 0 12px 0;}
-.card {flex:1 1 150px; min-width:150px; border-radius:12px; padding:10px 10px 6px 10px;}
-.card.picked {box-shadow:0 0 0 3px #facc15;}
-.card .side {font-size:0.8rem; font-weight:700; letter-spacing:1px; opacity:0.85;}
-.card .cverdict {font-size:1.4rem; font-weight:800; line-height:1.15;}
-.card .cconf {font-size:1.05rem; margin-bottom:4px;}
-.card ul {margin:0; padding-left:1.05rem; font-size:0.78rem; line-height:1.3;}
-.card li {margin-bottom:3px;}
+:root {--bg:#000000; --card:#1C1C1E; --card2:#2C2C2E; --sep:rgba(84,84,88,0.45);
+       --text:#F5F5F7; --muted:#8E8E93; --green:#34C759; --red:#FF3B30; --orange:#FF9500; --blue:#0A84FF;}
+/* hide Streamlit's own header, menu, toolbar, footer and deploy button */
+header[data-testid="stHeader"], #MainMenu, footer, .stDeployButton, [data-testid="stToolbar"],
+[data-testid="stDecoration"], [data-testid="stStatusWidget"], .viewerBadge_container__1QSob {display:none !important;}
+.stApp {background:var(--bg); font-family:__FONT__;}
+.stApp p, .stApp li, .stApp label, .stApp input, .stApp textarea, .stApp button, .stApp summary,
+.stApp h1, .stApp h2, .stApp h3 {font-family:__FONT__;}
+.block-container {max-width:500px !important; padding:0.8rem 1rem 4rem 1rem !important;}
+/* header */
+.appbar {display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:0.3rem;}
+.appbar .title {font-size:1.5rem; font-weight:700; letter-spacing:-0.02em; color:var(--text);}
+.pill {font-size:0.68rem; font-weight:600; color:var(--orange); border:1px solid rgba(255,149,0,0.4);
+       background:rgba(255,149,0,0.10); border-radius:999px; padding:3px 10px; white-space:nowrap;}
+/* cards */
+.card {background:var(--card); border-radius:18px; padding:16px 16px; border:1px solid rgba(255,255,255,0.06);
+       box-shadow:0 1px 3px rgba(0,0,0,0.5);}
+.hero {display:flex; align-items:center; justify-content:space-between; gap:14px;}
+.hero.go {border-color:rgba(52,199,89,0.35);} .hero.nogo {border-color:rgba(255,59,48,0.30);}
+.eyebrow {font-size:0.72rem; color:var(--muted); font-weight:600; letter-spacing:0.07em; text-transform:uppercase;}
+.hero .verdict {font-size:2.15rem; font-weight:800; letter-spacing:-0.02em; line-height:1.08; margin:3px 0 6px;}
+.hero .summary {font-size:0.86rem; color:var(--text); opacity:0.8; line-height:1.35;}
+.ring {flex:0 0 86px; position:relative; width:86px; height:86px;}
+.ring svg {transform:rotate(-90deg);}
+.ring .pct {position:absolute; top:0; left:0; right:0; bottom:0; display:flex; flex-direction:column;
+            align-items:center; justify-content:center; font-size:1.3rem; font-weight:700; color:var(--text);}
+.ring .pct small {font-size:0.58rem; color:var(--muted); font-weight:500; margin-top:-2px;}
+.two {display:grid; grid-template-columns:1fr 1fr; gap:10px;}
+.mini {background:var(--card); border-radius:16px; padding:12px 14px; border:1px solid rgba(255,255,255,0.06);}
+.mini.picked {border-color:rgba(10,132,255,0.8);}
+.mini .v {font-size:1.05rem; font-weight:700; margin:3px 0 9px;}
+.bar {height:6px; background:var(--card2); border-radius:3px; overflow:hidden;}
+.bar > div {height:100%; border-radius:3px;}
+.mini .c {font-size:0.78rem; color:var(--muted); margin-top:6px;}
+.tile {background:var(--card); border-radius:16px; padding:12px 14px; border:1px solid rgba(255,255,255,0.06);}
+.tile .k {font-size:0.72rem; color:var(--muted); font-weight:500;}
+.tile .val {font-size:1.2rem; font-weight:650; color:var(--text); margin-top:2px; letter-spacing:-0.01em;
+            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.tile .s {font-size:0.72rem; color:var(--muted); margin-top:1px;}
+.reasons {list-style:none; padding:0; margin:0;}
+.reasons li {display:flex; gap:10px; align-items:flex-start; font-size:0.87rem; line-height:1.38; padding:8px 0;
+             border-bottom:1px solid var(--sep); color:var(--text);}
+.reasons li:first-child {padding-top:0;} .reasons li:last-child {border-bottom:none; padding-bottom:0;}
+.dot {flex:0 0 8px; height:8px; border-radius:50%; margin-top:6px;}
+.note {font-size:0.78rem; color:var(--muted); line-height:1.45;}
+.warnline {font-size:0.82rem; color:var(--orange); line-height:1.4;}
+.section {font-size:0.72rem; color:var(--muted); font-weight:600; letter-spacing:0.07em; text-transform:uppercase;
+          margin:10px 2px -4px 2px;}
+.disc {background:rgba(255,59,48,0.08); border:1px solid rgba(255,59,48,0.3); border-radius:14px; padding:12px 14px;
+       font-size:0.85rem; line-height:1.45; color:var(--text);}
+/* expanders as rounded cards */
+[data-testid="stExpander"] details {background:var(--card); border-radius:16px !important;
+                                    border:1px solid rgba(255,255,255,0.06) !important;}
+[data-testid="stExpander"] summary p {font-weight:600; font-size:0.92rem;}
+/* tabs look like an iOS segmented control */
+[data-baseweb="tab-list"] {background:var(--card); border-radius:12px; padding:3px; gap:2px;}
+[data-baseweb="tab-list"] button {flex:1 1 0; border-radius:9px; padding:7px 2px !important; margin:0 !important;}
+[data-baseweb="tab-list"] button[aria-selected="true"] {background:var(--card2);}
+[data-baseweb="tab-list"] button p {font-size:0.84rem; font-weight:600;}
+[data-baseweb="tab-highlight"], [data-baseweb="tab-border"] {display:none !important;}
+[role="tablist"] {background:var(--card); border-radius:12px; padding:3px; gap:2px; border:none !important;
+                  box-shadow:none !important; display:flex; width:100%;}
+[data-testid="stTab"] {flex:1 1 0; display:flex; justify-content:center; border-radius:9px;
+                       padding:7px 2px !important; margin:0 !important;}
+[data-testid="stTab"][aria-selected="true"] {background:var(--card2);}
+[data-testid="stTab"] p {font-size:0.85rem; font-weight:600; color:var(--text);}
+[data-testid="stTab"][aria-selected="false"] p {color:var(--muted);}
+.react-aria-SelectionIndicator {display:none !important;}
+.reasons li {margin-left:0 !important;}
+.rows {background:var(--card); border-radius:16px; border:1px solid rgba(255,255,255,0.06); padding:2px 14px;}
+.row {display:flex; justify-content:space-between; align-items:center; gap:12px; padding:10px 0;
+      border-bottom:1px solid var(--sep);}
+.row:last-child {border-bottom:none;}
+.row .l {font-size:0.88rem; color:var(--text); line-height:1.25;}
+.row .l small {display:block; color:var(--muted); font-size:0.72rem; margin-top:1px;}
+.row .r {font-size:0.92rem; font-weight:600; color:var(--text); white-space:nowrap; text-align:right;}
+.legend {display:flex; flex-wrap:wrap; gap:4px 12px; font-size:0.75rem; color:var(--muted); margin-bottom:-8px;}
+.legend span b {display:inline-block; width:12px; height:3px; border-radius:2px; vertical-align:middle; margin-right:5px;}
+/* buttons and forms */
+.stButton button, .stDownloadButton button, .stFormSubmitButton button {border-radius:12px; font-weight:600;}
+.stFormSubmitButton button {width:100%; padding:0.55rem;}
+[data-testid="stFormSubmitButton"] button, [data-testid="stFormSubmitButton"] {width:100% !important;}
+[data-testid="stFormSubmitButton"] button {padding:0.55rem;}
+[data-testid="stForm"] {border:none; padding:0;}
 </style>
-"""
+""".replace("__FONT__", FONT_STACK)
 
-DISCLAIMER = ("⚠️ <b>Not financial advice.</b> Leveraged trading can lose your entire collateral. "
+DISCLAIMER = ("<b>Not financial advice.</b> Leveraged trading can lose your entire collateral. "
               "This tool is for education only - always do your own research.")
 
 
@@ -1044,136 +1133,94 @@ def usd(v: float) -> str:
     return f"{v:,.2f} USDT"
 
 
-def metric_pairs(items):
-    """Show metrics two per row - looks tidy on a phone."""
-    for k in range(0, len(items), 2):
-        cols = st.columns(2)
-        for col, item in zip(cols, items[k:k + 2]):
-            col.metric(item[0], item[1], help=item[2] if len(item) > 2 else None)
+def html(block: str):
+    st.markdown(block, unsafe_allow_html=True)
 
 
-def show_fig(fig):
-    cfg = {"displaylogo": False, "scrollZoom": False, "responsive": True,
-           "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d"]}
+def tiles(items, cls="two"):
+    """A tidy grid of number tiles: items = [(label, value, sub-text), ...]."""
+    cells = ""
+    for it in items:
+        k, v = it[0], it[1]
+        sub = it[2] if len(it) > 2 and it[2] else ""
+        colour = f' style="color:{it[3]}"' if len(it) > 3 and it[3] else ""
+        cells += (f'<div class="tile"><div class="k">{_html.escape(k)}</div><div class="val"{colour}>'
+                  f'{_html.escape(v)}</div>' + (f'<div class="s">{_html.escape(sub)}</div>' if sub else "")
+                  + "</div>")
+    html(f'<div class="{cls}">{cells}</div>')
+
+
+def rows(items):
+    """iOS-style grouped list: label (+ small sub-text) on the left, value on the right."""
+    out = ""
+    for it in items:
+        k, v = it[0], it[1]
+        sub = f"<small>{_html.escape(it[2])}</small>" if len(it) > 2 and it[2] else ""
+        colour = f' style="color:{it[3]}"' if len(it) > 3 and it[3] else ""
+        out += (f'<div class="row"><div class="l">{_html.escape(k)}{sub}</div>'
+                f'<div class="r"{colour}>{_html.escape(v)}</div></div>')
+    html(f'<div class="rows">{out}</div>')
+
+
+def show_fig(fig, height=None):
+    cfg = {"displayModeBar": False, "displaylogo": False, "scrollZoom": False, "responsive": True}
     try:
         st.plotly_chart(fig, width="stretch", config=cfg)        # newer Streamlit
     except Exception:
         st.plotly_chart(fig, use_container_width=True, config=cfg)  # older Streamlit
 
 
-def settings_form():
-    """Inputs at the top of the page (easier than a sidebar on a phone)."""
-    ss = st.session_state
-    defaults = dict(pair="BTCUSDT", style="Day", collateral=100.0, leverage=3,
-                    custom_st=False, st_period=10, st_mult=3.0)
-    for k, v in defaults.items():
-        ss.setdefault(f"cfg_{k}", v)
-    with st.expander("⚙️ Settings - tap to change pair, amount, leverage, style", expanded=False):
-        with st.form("settings"):
-            c1, c2 = st.columns(2)
-            in_list = ss.cfg_pair in POPULAR_PAIRS
-            choice = c1.selectbox("Pair", POPULAR_PAIRS + ["Other (type it)"],
-                                  index=POPULAR_PAIRS.index(ss.cfg_pair) if in_list else len(POPULAR_PAIRS))
-            custom = c2.text_input("Or type a pair", value="" if in_list else ss.cfg_pair,
-                                   placeholder="e.g. PEPEUSDT")
-            style = st.radio("Trade style", list(STYLES), horizontal=True,
-                             index=list(STYLES).index(ss.cfg_style))
-            st.caption(" · ".join(f"**{k}**: {v['lev_range'][0]}-{v['lev_range'][1]}x" for k, v in STYLES.items()))
-            collateral = st.number_input("Collateral (USDT you put in)", min_value=1.0, max_value=10_000_000.0,
-                                         value=float(ss.cfg_collateral), step=10.0)
-            leverage = st.slider("Leverage", 1, 25, int(ss.cfg_leverage))
-            with st.expander("Advanced: Supertrend settings"):
-                custom_st = st.checkbox("Use my own Supertrend settings", value=ss.cfg_custom_st)
-                c3, c4 = st.columns(2)
-                st_period = c3.number_input("ATR period", 5, 50, int(ss.cfg_st_period))
-                st_mult = c4.number_input("Multiplier", 1.0, 6.0, float(ss.cfg_st_mult), step=0.5)
-            if st.form_submit_button("🔍 Analyse", type="primary"):
-                raw = custom.strip() or (choice if choice in POPULAR_PAIRS else "")
-                try:
-                    base, quote = parse_pair(raw)
-                    if not 2 <= len(base) <= 15:
-                        raise DataError("That pair name doesn't look right.")
-                    ss.cfg_pair = base + quote
-                except DataError as e:
-                    st.error(f"{e} Keeping {ss.cfg_pair}.")
-                ss.cfg_style, ss.cfg_collateral, ss.cfg_leverage = style, float(collateral), int(leverage)
-                ss.cfg_custom_st, ss.cfg_st_period, ss.cfg_st_mult = custom_st, int(st_period), float(st_mult)
-                st.rerun()
-    cfg = STYLES[ss.cfg_style]
-    st_period = ss.cfg_st_period if ss.cfg_custom_st else cfg["st_period"]
-    st_mult = ss.cfg_st_mult if ss.cfg_custom_st else cfg["st_mult"]
-    return (ss.cfg_pair, ss.cfg_style, float(ss.cfg_collateral), int(ss.cfg_leverage),
-            int(st_period), float(st_mult))
+def submit(label: str) -> bool:
+    """Full-width primary form button (works on old and new Streamlit)."""
+    try:
+        return st.form_submit_button(label, type="primary", width="stretch")
+    except TypeError:
+        return st.form_submit_button(label, type="primary", use_container_width=True)
 
 
-def render_learning(entries, pair, style, decision):
-    st.subheader("🧠 Learning from your results")
-    st.info("After a trade, come back and log whether it was a **Win** or a **Loss**. "
-            "The app then nudges future confidence for that style (and that pair, once it has 5+ results) "
-            "up or down a little - between x0.80 and x1.15.")
-    st.warning("**Important:** on free Streamlit Cloud the saved log is **wiped** whenever the app "
-               "restarts, goes to sleep or is updated. Tap **Download backup (CSV)** after logging, "
-               "and use **Restore from CSV** to bring your history back.")
-    with st.form("log_trade", clear_on_submit=True):
-        st.markdown("**Log a result**")
-        c1, c2 = st.columns(2)
-        lp = c1.text_input("Pair", value=pair)
-        ls = c2.selectbox("Style", list(STYLES), index=list(STYLES).index(style))
-        ld = c1.selectbox("Direction", ["LONG", "SHORT"],
-                          index=0 if (decision or {}).get("direction", 1) == 1 else 1)
-        lc = c2.number_input("Confidence shown (%)", 0, 100, int((decision or {}).get("confidence", 50)))
-        lo = st.radio("Outcome", ["Win", "Loss"], horizontal=True)
-        ldate = st.date_input("Trade date", value=datetime.now(LOCAL_TZ).date())
-        if st.form_submit_button("💾 Save result"):
-            try:
-                b, q = parse_pair(lp)
-                entries.append(dict(date=str(ldate), pair=b + q, style=ls, direction=ld,
-                                    confidence=float(lc), outcome=lo))
-                st.session_state.learning_log = entries
-                ok = save_log(entries)
-                st.success("Saved." + ("" if ok else " (Couldn't write the file, so it's kept for this "
-                                       "session only - download a backup!)"))
-            except DataError as e:
-                st.error(str(e))
+def seg(label, options, default, key=None, help=None):
+    """iOS-style segmented control (falls back to horizontal radio on old Streamlit)."""
+    try:
+        v = st.segmented_control(label, options, default=default, key=key, help=help, selection_mode="single")
+    except Exception:
+        v = st.radio(label, options, index=options.index(default), horizontal=True, key=key, help=help)
+    return v if v in options else default
 
-    df = log_to_df(entries)
-    if df.empty:
-        st.caption("No results logged yet.")
-    else:
-        items = []
-        for s in STYLES:
-            sd = df[df["style"] == s]
-            if len(sd):
-                items.append((f"{s} win rate", f"{(sd['outcome'] == 'Win').mean() * 100:.0f}%",
-                              f"{len(sd)} results"))
-        items.append(("Total logged", str(len(df))))
-        metric_pairs(items)
-        _, note = learning_multiplier(entries, style, pair)
-        st.caption(f"Current adjustment for {style} / {pair}: {note}")
-        with st.expander("See all logged results"):
-            st.dataframe(df.iloc[::-1], hide_index=True)
-    st.download_button("⬇️ Download backup (CSV)", df.to_csv(index=False).encode("utf-8"),
-                       file_name="learning_log.csv", mime="text/csv", disabled=df.empty)
-    with st.expander("⬆️ Restore from CSV"):
-        up = st.file_uploader("Choose your learning_log.csv", type=["csv"])
-        if up is not None and st.button("Restore these results"):
-            try:
-                new = csv_to_entries(up.getvalue())
-                seen = {json.dumps(e, sort_keys=True) for e in entries}
-                added = [e for e in new if json.dumps(e, sort_keys=True) not in seen]
-                entries.extend(added)
-                st.session_state.learning_log = entries
-                save_log(entries)
-                st.success(f"Restored {len(added)} results.")
-            except Exception as e:
-                st.error(f"Couldn't read that file: {str(e)[:150]}")
-    with st.expander("🗑️ Clear all results"):
-        sure = st.checkbox("Yes, I want to delete my logged results")
-        if st.button("Delete everything", disabled=not sure):
-            entries.clear()
-            st.session_state.learning_log = entries
-            save_log(entries)
-            st.success("Cleared.")
+
+_KIND_COLOUR = {"bad": IOS["red"], "warn": IOS["orange"], "good": IOS["green"], "info": IOS["muted"]}
+
+
+def _reason_items(dec: dict) -> list[tuple[str, str]]:
+    """Blockers first, then reasons; leading emoji turned into coloured dots."""
+    out = []
+    for text, blocker in [(b, True) for b in dec["blockers"]] + [(r, False) for r in dec["reasons"]]:
+        t, kind = text.strip(), ("bad" if blocker else "info")
+        for mark, k in (("✅", "good"), ("⚠️", "warn"), ("🧠", "info"), ("❌", "bad")):
+            if t.startswith(mark):
+                t, kind = t[len(mark):].strip(), ("bad" if blocker else k)
+        out.append((kind, t))
+    return out
+
+
+def reasons_html(items) -> str:
+    lis = "".join(f'<li><span class="dot" style="background:{_KIND_COLOUR[k]}"></span>'
+                  f'<span>{_html.escape(t)}</span></li>' for k, t in items)
+    return f'<ul class="reasons">{lis}</ul>'
+
+
+def ring_html(pct: int, colour: str) -> str:
+    r, w = 36, 8
+    c = 2 * math.pi * r
+    off = c * (1 - max(0, min(100, pct)) / 100)
+    return (f'<div class="ring"><svg width="86" height="86" viewBox="0 0 86 86">'
+            f'<circle cx="43" cy="43" r="{r}" stroke="#2C2C2E" stroke-width="{w}" fill="none"/>'
+            f'<circle cx="43" cy="43" r="{r}" stroke="{colour}" stroke-width="{w}" fill="none" '
+            f'stroke-linecap="round" stroke-dasharray="{c:.1f}" stroke-dashoffset="{off:.1f}"/></svg>'
+            f'<div class="pct">{pct}%<small>confidence</small></div></div>')
+
+
+def verdict_colour(dec: dict) -> str:
+    return IOS["green"] if dec["verdict"].startswith("GO") else IOS["red"]
 
 
 def run_analysis(pair, style, collateral, leverage, st_period, st_mult, entries):
@@ -1206,189 +1253,227 @@ def run_analysis(pair, style, collateral, leverage, st_period, st_mult, entries)
     return out
 
 
-def side_card_html(dec: dict, highlighted: bool) -> str:
-    """One small card (LONG or SHORT) for the side-by-side view."""
-    cls = "go" if dec["verdict"].startswith("GO") else "nogo"
-    verdict = dec["verdict"] if dec["verdict"].startswith("GO") else "NO-GO"
-    items = [f"❌ {b}" for b in dec["blockers"][:3]]
-    items += [r for r in dec["reasons"] if r.startswith("✅")][: max(0, 3 - len(items))]
-    lis = "".join(f"<li>{_html.escape(t)}</li>" for t in items)
-    star = " ★" if highlighted else ""
-    return (f'<div class="card {cls}{" picked" if highlighted else ""}">'
-            f'<div class="side">{dec["side"]}{star}</div><div class="cverdict">{verdict}</div>'
-            f'<div class="cconf">{dec["confidence"]}%</div><ul>{lis}</ul></div>')
+def settings_card():
+    """One settings card. Open on the first visit, folded away after the first Analyse."""
+    ss = st.session_state
+    defaults = dict(pair="BTCUSDT", style="Day", collateral=100.0, leverage=3,
+                    custom_st=False, st_period=10, st_mult=3.0)
+    for k, v in defaults.items():
+        ss.setdefault(f"cfg_{k}", v)
+    ss.setdefault("last_mode", DIRECTION_MODES[0])
+    label = f"{ss.cfg_pair} · {ss.cfg_style} · {ss.cfg_collateral:,.0f} USDT · {ss.cfg_leverage}x"
+    with st.expander(f"⚙️  {label}", expanded=not ss.get("settings_used", False)):
+        with st.form("settings", border=False):
+            c1, c2 = st.columns(2)
+            in_list = ss.cfg_pair in POPULAR_PAIRS
+            choice = c1.selectbox("Pair", POPULAR_PAIRS + ["Other (type it)"],
+                                  index=POPULAR_PAIRS.index(ss.cfg_pair) if in_list else len(POPULAR_PAIRS))
+            custom = c2.text_input("Or type a pair", value="" if in_list else ss.cfg_pair,
+                                   placeholder="e.g. PEPEUSDT")
+            style = seg("Trade style", list(STYLES), ss.cfg_style)
+            collateral = st.number_input("Collateral (USDT)", min_value=1.0, max_value=10_000_000.0,
+                                         value=float(ss.cfg_collateral), step=10.0)
+            leverage = st.slider("Leverage", 1, 25, int(ss.cfg_leverage))
+            st.caption("Suggested: " + " · ".join(f"{k} {v['lev_range'][0]}-{v['lev_range'][1]}x"
+                                                  for k, v in STYLES.items()))
+            with st.expander("Advanced: Supertrend"):
+                custom_st = st.checkbox("Use my own Supertrend settings", value=ss.cfg_custom_st)
+                c3, c4 = st.columns(2)
+                st_period = c3.number_input("ATR period", 5, 50, int(ss.cfg_st_period))
+                st_mult = c4.number_input("Multiplier", 1.0, 6.0, float(ss.cfg_st_mult), step=0.5)
+            if submit("Analyse"):
+                raw = custom.strip() or (choice if choice in POPULAR_PAIRS else "")
+                try:
+                    base, quote = parse_pair(raw)
+                    if not 2 <= len(base) <= 15:
+                        raise DataError("That pair name doesn't look right.")
+                    ss.cfg_pair = base + quote
+                except DataError as e:
+                    st.error(f"{e} Keeping {ss.cfg_pair}.")
+                ss.cfg_style, ss.cfg_collateral, ss.cfg_leverage = style, float(collateral), int(leverage)
+                ss.cfg_custom_st, ss.cfg_st_period, ss.cfg_st_mult = custom_st, int(st_period), float(st_mult)
+                ss.settings_used = True
+                st.rerun()
+        # Outside the form so it switches instantly (no new download needed).
+        mode = seg("Show side", DIRECTION_MODES, ss.last_mode, key="direction_mode",
+                   help="Auto shows whichever side (long or short) has the higher confidence. "
+                        "The Long and Short cards always show both.")
+        ss.last_mode = mode
+    cfg = STYLES[ss.cfg_style]
+    st_period = ss.cfg_st_period if ss.cfg_custom_st else cfg["st_period"]
+    st_mult = ss.cfg_st_mult if ss.cfg_custom_st else cfg["st_mult"]
+    return (ss.cfg_pair, ss.cfg_style, float(ss.cfg_collateral), int(ss.cfg_leverage),
+            int(st_period), float(st_mult), mode)
 
 
-def render_tabs(res, pair, style, collateral, leverage, entries, mode=DIRECTION_MODES[0]):
+def render_journal(entries, pair, style, decision):
+    """Journal tab: log Win / Loss results, see the learning summary, back up / restore."""
+    html('<div class="card"><div class="note" style="color:var(--text)">Log each trade as a <b>Win</b> or '
+         '<b>Loss</b>. Future confidence for that style (and pair or direction, once it has 5+ results) is '
+         'nudged between x0.80 and x1.15.</div><div class="warnline" style="margin-top:8px">Free Streamlit '
+         'Cloud wipes the journal when the app restarts, sleeps or updates. Download a backup after '
+         'logging.</div></div>')
+    with st.form("log_trade", clear_on_submit=True, border=False):
+        c1, c2 = st.columns(2)
+        lp = c1.text_input("Pair", value=pair)
+        ls = c2.selectbox("Style", list(STYLES), index=list(STYLES).index(style))
+        ld = c1.selectbox("Direction", ["LONG", "SHORT"],
+                          index=0 if (decision or {}).get("direction", 1) == 1 else 1)
+        lc = c2.number_input("Confidence shown (%)", 0, 100, int((decision or {}).get("confidence", 50)))
+        lo = st.radio("Outcome", ["Win", "Loss"], horizontal=True)
+        ldate = st.date_input("Trade date", value=datetime.now(LOCAL_TZ).date())
+        if submit("Save result"):
+            try:
+                b, q = parse_pair(lp)
+                entries.append(dict(date=str(ldate), pair=b + q, style=ls, direction=ld,
+                                    confidence=float(lc), outcome=lo))
+                st.session_state.learning_log = entries
+                ok = save_log(entries)
+                st.success("Saved." + ("" if ok else " (Couldn't write the file, so it's kept for this "
+                                       "session only - download a backup!)"))
+            except DataError as e:
+                st.error(str(e))
+
+    df = log_to_df(entries)
+    if df.empty:
+        html('<div class="note">No results logged yet.</div>')
+    else:
+        items = [("Logged", str(len(df)), f"{(df['outcome'] == 'Win').mean() * 100:.0f}% wins overall")]
+        for s in STYLES:
+            sd = df[df["style"] == s]
+            if len(sd):
+                items.append((f"{s}", f"{(sd['outcome'] == 'Win').mean() * 100:.0f}% wins", f"{len(sd)} results"))
+        tiles(items)
+        _, note = learning_multiplier(entries, style, pair, (decision or {}).get("direction"))
+        html(f'<div class="note">Current adjustment: {_html.escape(note)}</div>')
+        with st.expander("All results"):
+            st.dataframe(df.iloc[::-1], hide_index=True)
+    st.download_button("Download backup (CSV)", df.to_csv(index=False).encode("utf-8"),
+                       file_name="learning_log.csv", mime="text/csv", disabled=df.empty)
+    with st.expander("Restore from backup"):
+        up = st.file_uploader("Choose your learning_log.csv", type=["csv"])
+        if up is not None and st.button("Restore these results"):
+            try:
+                new = csv_to_entries(up.getvalue())
+                seen = {json.dumps(e, sort_keys=True) for e in entries}
+                added = [e for e in new if json.dumps(e, sort_keys=True) not in seen]
+                entries.extend(added)
+                st.session_state.learning_log = entries
+                save_log(entries)
+                st.success(f"Restored {len(added)} results.")
+            except Exception as e:
+                st.error(f"Couldn't read that file: {str(e)[:150]}")
+    with st.expander("Clear all results"):
+        sure = st.checkbox("Yes, delete my logged results")
+        if st.button("Delete everything", disabled=not sure):
+            entries.clear()
+            st.session_state.learning_log = entries
+            save_log(entries)
+            st.success("Cleared.")
+
+
+def render_home(res, mode):
+    """Decision card, Long/Short mini cards and the 4 key numbers."""
+    decisions, mtf = res["decisions"], res["mtf"]
+    chosen = pick_side(decisions, mode)
+    dec, pos = decisions[chosen], res["pos"][chosen]
+    is_go = dec["verdict"].startswith("GO")
+    items = _reason_items(dec)
+    summary = items[0][1] if items else ""
+    how = "best side" if mode.startswith("Auto") else "your pick"
+    html(f'<div class="card hero {"go" if is_go else "nogo"}"><div>'
+         f'<div class="eyebrow">{dec["side"]} · {how}</div>'
+         f'<div class="verdict" style="color:{verdict_colour(dec)}">{dec["verdict"]}</div>'
+         f'<div class="summary">{_html.escape(summary)}</div></div>'
+         f'{ring_html(dec["confidence"], verdict_colour(dec))}</div>')
+
+    minis = ""
+    for d in (1, -1):
+        x = decisions[d]
+        colour = verdict_colour(x)
+        minis += (f'<div class="mini{" picked" if d == chosen else ""}"><div class="eyebrow">{x["side"]}</div>'
+                  f'<div class="v" style="color:{colour}">{x["verdict"]}</div>'
+                  f'<div class="bar"><div style="width:{x["confidence"]}%; background:{colour}"></div></div>'
+                  f'<div class="c">{x["confidence"]}% confidence</div></div>')
+    html(f'<div class="two">{minis}</div>')
+
+    if len(items) > 1:
+        html(f'<div class="card">{reasons_html(items[1:3])}</div>')
+    with st.expander("Show all reasons"):
+        for d in (chosen, -chosen):
+            x = decisions[d]
+            html(f'<div class="section">{x["side"]} · {x["verdict"]} · {x["confidence"]}%</div>')
+            html(f'<div style="height:10px"></div>{reasons_html(_reason_items(x))}<div style="height:6px"></div>')
+
+    sign = -1 if pos["direction"] == 1 else 1
+    liq_col = IOS["red"] if pos["liq_before_stop"] else (IOS["orange"] if pos["liq_close"] else None)
+    html(f'<div class="section">{dec["side"]} plan · {pos["notional"]:,.0f} USDT position</div>')
+    tiles([
+        ("Entry", fmt_price(pos["entry"]), "price now"),
+        ("Stop-loss", fmt_price(pos["stop"]), f"{sign * pos['stop_pct'] * 100:+.2f}%", IOS["red"]),
+        ("Target", fmt_price(pos["target"]), f"{-sign * pos['target_pct'] * 100:+.2f}%", IOS["green"]),
+        ("Liquidation", fmt_price(pos["liq"]), f"{sign * pos['liq_pct'] * 100:+.2f}%", liq_col),
+    ])
+    if pos["liq_before_stop"]:
+        html(f'<div class="warnline" style="color:{IOS["red"]}">You would be liquidated before the stop. '
+             f'Use {pos["max_safe_lev"]}x or less.</div>')
+    last_t = mtf["tfs"][mtf["primary"]]["last_time"].tz_convert(LOCAL_TZ)
+    src = ", ".join(sorted({re.sub(r"\s*\([A-Z0-9-]+\)$", "", x) for x in mtf["sources"]}))
+    html(f'<div class="note">{_html.escape(src)} · {mtf["primary"]} · updated {last_t:%H:%M} Sri Lanka time. '
+         'The latest candle is still forming, so this can change.</div>')
+    return chosen
+
+
+def render_details(res, style, leverage, chosen):
     cfg = STYLES[style]
     lo, hi = cfg["lev_range"]
-    mtf, bt, decisions = res["mtf"], res["bt"], res["decisions"]
+    mtf, pos = res["mtf"], (res["pos"] or {}).get(chosen)
     funding_rate, funding_src, funding_est = res["funding"]
-    # The side the user chose (or the best side in Auto) drives the banner,
-    # the Position tab, the chart's stop/target lines and the learning default.
-    chosen = pick_side(decisions, mode) if decisions else 1
-    decision = decisions.get(chosen) if decisions else None
-    pos = res["pos"].get(chosen) if res["pos"] else None
-
-    tabs = st.tabs(["🎯 Decision", "📊 Chart", "💰 Position", "🔍 Analysis",
-                    "🧪 Backtest", "🧠 Learning", "⚠️ Warnings"])
-
-    # ---------------- Decision ----------------
-    with tabs[0]:
-        if decision:
-            cls = "go" if decision["verdict"].startswith("GO") else "nogo"
-            how = "best side" if mode.startswith("Auto") else "your choice"
-            st.markdown(f'<div class="banner {cls}"><div class="verdict">{decision["verdict"]}</div>'
-                        f'<div class="conf">Confidence {decision["confidence"]}%</div>'
-                        f'<div class="sub">Showing the {decision["side"]} side ({how})</div></div>',
-                        unsafe_allow_html=True)
-            st.markdown("**Long vs Short** - each side is checked separately:")
-            st.markdown('<div class="cards">' + side_card_html(decisions[1], chosen == 1)
-                        + side_card_html(decisions[-1], chosen == -1) + "</div>", unsafe_allow_html=True)
-            if decision["blockers"]:
-                st.markdown(f"**Why the {decision['side']} side is NO-GO:**")
-                for b in decision["blockers"]:
-                    st.markdown(f"- ❌ {b}")
-            st.markdown(f"**What the app saw for {decision['side']}:**")
-            for r in decision["reasons"][:8]:
-                st.markdown(f"- {r}")
-            other = decisions[-chosen]
-            with st.expander(f"All reasons for the {other['side']} side ({other['verdict']}, {other['confidence']}%)"):
-                for b in other["blockers"]:
-                    st.markdown(f"- ❌ {b}")
-                for r in other["reasons"]:
-                    st.markdown(f"- {r}")
-            metric_pairs([("Price now", fmt_price(pos["entry"])),
-                          ("Score", f"{decision['score']:+.0f} / 100")])
-            last_t = mtf["tfs"][mtf["primary"]]["last_time"].tz_convert(LOCAL_TZ)
-            st.caption(f"Data: {', '.join(mtf['sources'])} · latest candle {last_t:%d %b %H:%M} "
-                       f"{LOCAL_TZ_LABEL}. The newest candle is still forming, so signals can change.")
-            for p in mtf["problems"]:
-                st.warning(f"Skipped {p}.")
-        else:
-            st.info("No decision yet - see the message above.")
-
-    # ---------------- Chart ----------------
-    with tabs[1]:
-        if mtf:
-            show_fig(price_chart(mtf["tfs"][mtf["primary"]]["data"], pair, mtf["primary"], pos))
-            side_txt = decision["side"] if decision else "LONG"
-            st.caption("Green/red line = Supertrend. Thin coloured lines = EMAs 9/21/50/200. "
-                       f"Dashed lines = entry, stop and target for the {side_txt} side "
-                       "(liquidation too, if it's close enough to show). "
-                       "Middle = volume. Bottom = RSI (above 70 overbought, below 30 oversold). "
-                       "Pinch to zoom, drag to move. Prices are cached for 60 seconds - tap "
-                       "**Refresh data** for the newest.")
-
-    # ---------------- Position ----------------
-    with tabs[2]:
-        if pos:
-            side = "LONG" if pos["direction"] == 1 else "SHORT"
-            st.markdown(f"**If you opened a {side} now** (isolated margin, {leverage}x):")
-            st.caption("Long and short have different stop, target and liquidation prices. "
-                       "This tab follows the **Show side** switch at the top (in Auto it shows the "
-                       "side with the higher confidence).")
-            metric_pairs([
-                ("Position size", usd(pos["notional"])), ("Quantity", f"{pos['qty']:.6g} coins"),
-                ("Entry (now)", fmt_price(pos["entry"])), ("Liquidation ≈", fmt_price(pos["liq"])),
-                ("Stop-loss", fmt_price(pos["stop"]), f"{cfg['stop_atr']} x ATR from entry (at least {cfg['min_stop_pct'] * 100:.2f}%)"),
-                ("Take-profit", fmt_price(pos["target"]), f"{cfg['rr']} x the stop distance"),
-                ("Distance to stop", f"{pos['stop_pct'] * 100:.2f}%"),
-                ("Distance to liquidation", f"{pos['liq_pct'] * 100:.2f}%"),
-            ])
-            if pos["liq_before_stop"]:
-                st.error(f"🚨 At {leverage}x you would be **liquidated before your stop-loss is reached**. "
-                         f"Use **{pos['max_safe_lev']}x or less** for this setup.")
-            elif pos["liq_close"]:
-                st.warning(f"⚠️ Liquidation is uncomfortably close to the stop. Safer: "
-                           f"{pos['max_safe_lev']}x or less.")
-            else:
-                st.success(f"✅ Your stop would be hit well before liquidation. "
-                           f"Max safe leverage here ≈ {pos['max_safe_lev']}x.")
-            st.markdown("**Costs (estimated)**")
-            metric_pairs([
-                ("Fees (in + out)", usd(pos["fees"]), "0.04% taker fee each way"),
-                ("Slippage", usd(pos["slippage"]), f"{cfg['slippage'] * 100:.2f}% each way"),
-                (f"Funding (~{pos['hold_hours']}h)", usd(pos["funding"]),
-                 f"Rate {funding_rate * 100:.4f}% per 8h from {funding_src}"
-                 + (" (estimated)" if funding_est else "") + ". Assumed you pay it."),
-                ("Total costs", f"{usd(pos['costs'])}", f"{pos['costs_pct_collateral']:.2f}% of your collateral"),
-                ("Loss if stop hit", f"{usd(pos['risk'])}", f"{pos['risk_pct_collateral']:.1f}% of collateral, incl. costs"),
-                ("Profit if target hit", usd(pos["reward"]), "after costs"),
-                ("Reward : risk after costs", f"{pos['rr_after_costs']:.2f}"),
-                ("Max safe leverage", f"{pos['max_safe_lev']}x"),
-            ])
-            st.caption(f"Total costs = {pos['costs_pct_collateral']:.2f}% of collateral. "
-                       f"Liquidation uses a simple formula with {MAINT_MARGIN_RATE * 100:.1f}% maintenance "
-                       "margin; your exchange's real figure may differ a little.")
-
-    # ---------------- Analysis ----------------
-    with tabs[3]:
-        if mtf:
-            st.markdown(f"Combined score: **{mtf['score']:+.0f} / 100** (−100 very bearish, +100 very "
-                        "bullish). Each timeframe is scored, then weighted for your style:")
+    if pos:
+        side = "LONG" if pos["direction"] == 1 else "SHORT"
+        html(f'<div class="section">{side} position · {leverage}x isolated</div>')
+        tiles([
+            ("Position size", usd(pos["notional"]), f"{pos['qty']:.6g} coins"),
+            ("Max safe leverage", f"{pos['max_safe_lev']}x", f"suggested {lo}-{hi}x"),
+            ("Loss if stopped", usd(pos["risk"]), f"{pos['risk_pct_collateral']:.1f}% incl. costs", IOS["red"]),
+            ("Profit at target", usd(pos["reward"]), f"R:R {pos['rr_after_costs']:.2f} after costs", IOS["green"]),
+        ])
+        if pos["liq_before_stop"]:
+            st.error(f"At {leverage}x you'd be liquidated before your stop-loss. Use {pos['max_safe_lev']}x or less.")
+        elif pos["liq_close"]:
+            html(f'<div class="warnline">Liquidation is close to the stop. Safer: {pos["max_safe_lev"]}x or less.</div>')
+        rows([
+            ("Distance to stop", f"{pos['stop_pct'] * 100:.2f}%",
+             f"{cfg['stop_atr']} x ATR, at least {cfg['min_stop_pct'] * 100:.2f}%"),
+            ("Distance to liquidation", f"{pos['liq_pct'] * 100:.2f}%",
+             f"estimate with {MAINT_MARGIN_RATE * 100:.1f}% maintenance margin"),
+        ])
+        html('<div class="section">Costs</div>')
+        rows([
+            ("Fees in + out", usd(pos["fees"]), "0.04% taker fee each way"),
+            ("Slippage", usd(pos["slippage"]), f"{cfg['slippage'] * 100:.2f}% each way"),
+            (f"Funding (~{pos['hold_hours']}h hold)", usd(pos["funding"]),
+             f"{funding_rate * 100:.4f}% per 8h · {'estimated' if funding_est else funding_src} · assumed you pay"),
+            ("Total costs", usd(pos["costs"]), f"{pos['costs_pct_collateral']:.2f}% of your collateral"),
+        ])
+        html('<div class="note">Follows the <b>Show side</b> switch in Settings (in Auto, the stronger side). '
+             'A long\'s stop sits below the price and a short\'s above it.</div>')
+    if mtf:
+        with st.expander(f"Analysis · score {mtf['score']:+.0f} / 100"):
+            html('<div class="note">Each timeframe is scored from −100 (very bearish) to +100 (very bullish) and '
+                 'weighted for your style. A positive score helps the long side, a negative one the short side. '
+                 'Supertrend is the key check: a side can only be GO if the main timeframe\'s Supertrend points '
+                 'its way and the biggest timeframe doesn\'t strongly disagree.</div>')
             for tf, r in mtf["tfs"].items():
-                label = " (main)" if tf == mtf["primary"] else ""
-                with st.expander(f"{_arrow(r['score'])} {tf}{label} · score {r['score']:+.0f} · "
-                                 f"weight {r['weight'] * 100:.0f}%", expanded=(tf == mtf["primary"])):
-                    for row in r["rows"]:
-                        st.markdown(f"{_arrow(row['pts'])} **{row['factor']}** ({row['pts']:+.0f}) - {row['text']}")
-            st.caption("A positive score helps the LONG side and a negative score helps the SHORT side, "
-                       "so the same analysis gives the two sides opposite strength. "
-                       "Supertrend is the key check: a side can only be GO if the main timeframe's "
-                       "Supertrend points its way and the biggest timeframe doesn't strongly disagree.")
-
-    # ---------------- Backtest ----------------
-    with tabs[4]:
-        if bt:
-            st.markdown(f"Tested the **{style}** rules on **{cfg['primary']}** candles from "
-                        f"**{bt['start'].tz_convert(LOCAL_TZ):%d %b %Y}** to "
-                        f"**{bt['end'].tz_convert(LOCAL_TZ):%d %b %Y}** (~{bt['days']:.0f} days, "
-                        f"{bt['n_candles']:,} candles, {leverage}x, all costs included).")
-            if style == "Scalp":
-                st.caption("Scalp uses 5-minute candles, so only the most recent few weeks are tested to keep it fast.")
-            if bt["n"] < 10:
-                st.warning(f"Only {bt['n']} trades - too few to trust much (low reliability).")
-            pf = "∞" if bt["pf"] == float("inf") else f"{bt['pf']:.2f}"
-            metric_pairs([
-                ("Trades", f"{bt['n']} ({bt['long_n']}L / {bt['short_n']}S)"),
-                ("Win rate", f"{bt['win_rate']:.0f}%"),
-                ("Avg win", f"{bt['avg_win']:+.1f}%", "per trade, on your collateral"),
-                ("Avg loss", f"{bt['avg_loss']:+.1f}%", "per trade, on your collateral"),
-                ("Expectancy", f"{bt['exp_r']:+.2f} R", "average result per trade in units of planned risk, after costs"),
-                ("Expectancy %", f"{bt['exp_pct']:+.2f}%", "average % gain/loss on collateral per trade"),
-                ("Profit factor", pf, "money won ÷ money lost (above 1.3 is decent)"),
-                ("Max drawdown", f"{bt['max_dd']:.1f}%", "biggest fall from a high point"),
-                ("Total return", f"{bt['total_ret']:+.1f}%", "whole account used on every trade"),
-                ("Liquidations", str(bt["liquidations"])),
-            ])
-            st.markdown("**Long trades vs short trades** (each side's decision uses its own results):")
-            for d_, nm in ((1, "Long"), (-1, "Short")):
-                s_ = bt["sides"][d_]
-                metric_pairs([(f"{nm} trades · win rate", f"{s_['n']} · {s_['win_rate']:.0f}%",
-                               "fewer than 10 trades = low reliability"),
-                              (f"{nm} expectancy", f"{s_['exp_r']:+.2f} R · {s_['exp_pct']:+.2f}%",
-                               "average result per trade after costs")])
-            if bt["wiped"]:
-                st.error("💥 With these settings the backtest account was wiped out.")
-            show_fig(equity_chart(bt))
-            if bt["n"]:
-                with st.expander("Last 20 backtest trades"):
-                    t = bt["trades"].tail(20).iloc[::-1].copy()
-                    t["when"] = to_local(pd.to_datetime(t["entry_time"], utc=True)).dt.strftime("%d %b %H:%M")
-                    t["result %"] = (t["ret"] * 100).round(1)
-                    st.dataframe(t[["when", "side", "reason", "result %"]], hide_index=True)
-            st.caption(f"Data: {bt.get('source', '')}. Past results do not guarantee future results.")
-        else:
-            st.info(res["bt_note"] or "Backtest not available.")
-
-    # ---------------- Learning ----------------
-    with tabs[5]:
-        render_learning(entries, pair, style, decision)
-
-    # ---------------- Warnings ----------------
-    with tabs[6]:
-        st.markdown(f'<div class="disclaimer">{DISCLAIMER}</div>', unsafe_allow_html=True)
+                main = " · main" if tf == mtf["primary"] else ""
+                html(f'<div class="section">{tf}{main} · score {r["score"]:+.0f} · weight {r["weight"] * 100:.0f}%</div>')
+                items = [("good" if row["pts"] > 0 else "bad" if row["pts"] < 0 else "info",
+                          f"{row['factor']} ({row['pts']:+.0f}): {row['text']}") for row in r["rows"]]
+                html(f'<div style="height:10px"></div>{reasons_html(items)}<div style="height:4px"></div>')
+            for p in mtf["problems"]:
+                html(f'<div class="warnline">Skipped {_html.escape(p)}.</div>')
+    with st.expander("Risks & disclaimer", expanded=not pos):
+        html(f'<div class="disc">{DISCLAIMER}</div>')
         st.markdown(
             "- **Leverage multiplies losses as well as gains.** At 10x, a 10% move against you wipes out your collateral.\n"
             "- The liquidation price is an **estimate**; your exchange may liquidate slightly earlier.\n"
@@ -1398,66 +1483,129 @@ def render_tabs(res, pair, style, collateral, leverage, entries, mode=DIRECTION_
             "- News, hacks and big announcements can move prices instantly, jumping past your stop.\n"
             "- Never trade money you can't afford to lose. Consider the lower end of the leverage range.")
         if pos and pos["liq_before_stop"]:
-            st.error("🚨 Your current leverage would be liquidated before the stop-loss.")
+            html(f'<div class="warnline" style="color:{IOS["red"]}">Your current leverage would be liquidated before the stop-loss.</div>')
         if leverage > hi:
-            st.warning(f"Your leverage ({leverage}x) is above the recommended {lo}-{hi}x for {style}.")
+            html(f'<div class="warnline">Your leverage ({leverage}x) is above the suggested {lo}-{hi}x for {style}.</div>')
         if funding_est:
-            st.info("The live funding rate was unavailable, so 0.01% per 8 hours was assumed.")
-        st.caption("Learning log: kept in a file that free Streamlit Cloud wipes on restart - "
-                   "download a CSV backup from the Learning tab.")
+            html('<div class="note">The live funding rate was unavailable, so 0.01% per 8 hours was assumed.</div>')
+        html('<div class="note">Journal: free Streamlit Cloud wipes it on restart - download a CSV backup.</div>')
+
+
+def render_backtest(res, style, leverage):
+    cfg, bt = STYLES[style], res["bt"]
+    if not bt:
+        html(f'<div class="note">{_html.escape(res["bt_note"] or "Backtest not available.")}</div>')
+        return
+    pf = "∞" if bt["pf"] == float("inf") else f"{bt['pf']:.2f}"
+    html(f'<div class="note">The {style} rules on {cfg["primary"]} candles, '
+         f'{bt["start"].tz_convert(LOCAL_TZ):%d %b %Y} – {bt["end"].tz_convert(LOCAL_TZ):%d %b %Y} '
+         f'(~{bt["days"]:.0f} days, {bt["n_candles"]:,} candles) at {leverage}x with fees, slippage and funding.'
+         + (" Scalp tests only the latest few weeks to stay quick." if style == "Scalp" else "") + "</div>")
+    exp_col = IOS["green"] if bt["exp_r"] > 0 and bt["exp_pct"] > 0 else IOS["red"]
+    tiles([
+        ("Trades", str(bt["n"]), f"{bt['long_n']} long · {bt['short_n']} short"),
+        ("Win rate", f"{bt['win_rate']:.0f}%", f"avg win {bt['avg_win']:+.1f}% · loss {bt['avg_loss']:+.1f}%"),
+        ("Expectancy", f"{bt['exp_r']:+.2f} R", f"{bt['exp_pct']:+.2f}% per trade", exp_col),
+        ("Profit factor", pf, "won ÷ lost · 1.3+ is decent"),
+        ("Max drawdown", f"{bt['max_dd']:.1f}%", "biggest fall from a high"),
+        ("Total return", f"{bt['total_ret']:+.1f}%", f"{bt['liquidations']} liquidations"),
+    ])
+    if bt["n"] < 10:
+        html(f'<div class="warnline">Only {bt["n"]} trades - too few to trust much (low reliability).</div>')
+    if bt["wiped"]:
+        html(f'<div class="warnline" style="color:{IOS["red"]}">With these settings the backtest account was wiped out.</div>')
+    show_fig(equity_chart(bt))
+    html('<div class="section">Long vs short trades</div>')
+    side_items = []
+    for d_, nm in ((1, "Long"), (-1, "Short")):
+        s_ = bt["sides"][d_]
+        col = IOS["green"] if s_["exp_r"] > 0 and s_["exp_pct"] > 0 else IOS["red"]
+        side_items.append((f"{nm} · {s_['n']} trades", f"{s_['exp_r']:+.2f} R",
+                           f"{s_['win_rate']:.0f}% wins · {s_['exp_pct']:+.2f}%/trade"
+                           + (" · low reliability" if s_["n"] < 10 else ""), col))
+    tiles(side_items)
+    html('<div class="note">Each side\'s decision uses only its own past trades.</div>')
+    if bt["n"]:
+        with st.expander("Last 20 trades"):
+            t = bt["trades"].tail(20).iloc[::-1].copy()
+            t["when"] = to_local(pd.to_datetime(t["entry_time"], utc=True)).dt.strftime("%d %b %H:%M")
+            t["result %"] = (t["ret"] * 100).round(1)
+            st.dataframe(t[["when", "side", "reason", "result %"]], hide_index=True)
+    html(f'<div class="note">Data: {_html.escape(bt.get("source", ""))}. Past results do not guarantee future results.</div>')
+
+
+def render_tabs(res, pair, style, collateral, leverage, entries, mode=DIRECTION_MODES[0]):
+    """Everything below the home screen, in four simple tabs."""
+    decisions = res["decisions"]
+    chosen = pick_side(decisions, mode) if decisions else 1
+    decision = decisions.get(chosen) if decisions else None
+    pos = (res["pos"] or {}).get(chosen)
+    mtf = res["mtf"]
+    t_chart, t_details, t_bt, t_journal = st.tabs(["Chart", "Details", "Backtest", "Journal"])
+    with t_chart:
+        if mtf:
+            leg = [("Supertrend", IOS["green"]), ("EMA 9", IOS["yellow"]), ("21", IOS["teal"]),
+                   ("50", IOS["purple"]), ("200", IOS["orange"])]
+            html('<div class="legend">' + "".join(f'<span><b style="background:{c}"></b>{n}</span>' for n, c in leg)
+                 + "</div>")
+            show_fig(price_chart(mtf["tfs"][mtf["primary"]]["data"], pair, mtf["primary"], pos))
+            side_txt = decision["side"].lower() if decision else "long"
+            html(f'<div class="note">{pair} · {mtf["primary"]} candles · {LOCAL_TZ_LABEL}. Supertrend turns red in a '
+                 f'down-trend. Dashed lines: entry, stop and target for the {side_txt} side. Below: volume, then '
+                 'RSI (over 70 stretched up, under 30 stretched down). Pinch to zoom.</div>')
+        else:
+            html('<div class="note">No chart - see the message above.</div>')
+    with t_details:
+        render_details(res, style, leverage, chosen)
+    with t_bt:
+        render_backtest(res, style, leverage)
+    with t_journal:
+        render_journal(entries, pair, style, decision)
 
 
 def main():
-    st.set_page_config(page_title="Crypto Trade Screener", page_icon="📈", layout="centered",
+    st.set_page_config(page_title="Trade Screener", page_icon="📈", layout="centered",
                        initial_sidebar_state="collapsed")
-    st.markdown(CSS, unsafe_allow_html=True)
-    st.markdown("### 📈 Leveraged Crypto Trade Screener")
-    st.markdown(f'<div class="disclaimer">{DISCLAIMER}</div>', unsafe_allow_html=True)
+    html(CSS)
+    html('<div class="appbar"><div class="title">Trade Screener</div>'
+         '<div class="pill">Not financial advice</div></div>')
 
-    pair, style, collateral, leverage, st_period, st_mult = settings_form()
+    pair, style, collateral, leverage, st_period, st_mult, mode = settings_card()
     cfg = STYLES[style]
     lo, hi = cfg["lev_range"]
-
-    top1, top2 = st.columns([3, 2])
-    top1.markdown(f"**{pair}** · **{style}** · {collateral:,.0f} USDT · **{leverage}x**")
-    if top2.button("🔄 Refresh data"):
-        fetch_live.clear()
-        fetch_funding.clear()
-        st.rerun()
-    st.caption(f"{cfg['desc']} Recommended leverage: {lo}-{hi}x.")
     if leverage > hi:
-        st.warning(f"⚠️ {leverage}x is **above** the recommended {lo}-{hi}x for {style} trading. "
-                   "Higher leverage means a small move can liquidate you.")
+        html(f'<div class="warnline">{leverage}x is above the suggested {lo}-{hi}x for {style}. '
+             'A small move could liquidate you.</div>')
     elif leverage < lo:
-        st.info(f"ℹ️ {leverage}x is below the usual {lo}-{hi}x for {style}. Safer, just smaller gains.")
+        html(f'<div class="note">{leverage}x is below the usual {lo}-{hi}x for {style}: safer, smaller gains.</div>')
 
     if "learning_log" not in st.session_state:
         st.session_state.learning_log = load_log()
     entries = st.session_state.learning_log
-
-    # Which side the big banner / Position tab / chart lines / learning default follow.
-    # Outside the settings form so switching is instant (no re-download).
-    mode = st.radio("Show side", DIRECTION_MODES, horizontal=True, key="direction_mode",
-                    help="Auto shows whichever side (long or short) has the higher confidence. "
-                         "The Long and Short cards always show both.")
 
     res = dict(mtf=None, bt=None, pos={}, decisions={}, bt_note=None,
                funding=(DEFAULT_FUNDING_8H, "estimate", True))
     try:
         res = run_analysis(pair, style, collateral, leverage, st_period, st_mult, entries)
     except DataError as e:
-        st.error(f"😕 {e}")
+        st.error(str(e))
     except requests.RequestException:
-        st.error("😕 Network problem while downloading prices. Please tap **Refresh data** in a minute.")
+        st.error("Network problem while downloading prices. Please tap Refresh in a minute.")
     except Exception as e:
-        st.error("😕 Something went wrong while analysing. Try Refresh, another pair or another style.")
+        st.error("Something went wrong while analysing. Try Refresh, another pair or another style.")
         with st.expander("Technical details (for troubleshooting)"):
             st.code(f"{type(e).__name__}: {str(e)[:300]}")
 
     try:
+        if res["decisions"]:
+            render_home(res, mode)
+        if st.button("↻  Refresh prices"):
+            fetch_live.clear()
+            fetch_funding.clear()
+            st.rerun()
         render_tabs(res, pair, style, collateral, leverage, entries, mode)
     except Exception as e:
-        st.error("😕 Part of the page couldn't be shown. Tap Refresh data to try again.")
+        st.error("Part of the page couldn't be shown. Tap Refresh to try again.")
         with st.expander("Technical details (for troubleshooting)"):
             st.code(f"{type(e).__name__}: {str(e)[:300]}")
 
