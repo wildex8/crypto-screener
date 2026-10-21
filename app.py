@@ -1412,7 +1412,7 @@ def run_analysis(pair, style, collateral, leverage, st_period, st_mult, entries)
 def settings_card():
     """One settings card. Open on the first visit, folded away after the first Analyse."""
     ss = st.session_state
-    defaults = dict(pair="BTCUSDT", style="Day", collateral=100.0, leverage=3,
+    defaults = dict(pair="BTCUSDT", style="Day", collateral=1000.0, leverage=5,
                     custom_st=False, st_period=10, st_mult=3.0)
     for k, v in defaults.items():
         ss.setdefault(f"cfg_{k}", v)
@@ -1691,23 +1691,23 @@ def render_backtest(res, style, leverage):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def cached_scan(style: str, pairs: tuple, collateral: float, log_json: str) -> dict:
+def cached_scan(style: str, pairs: tuple, collateral: float, log_json: str, leverage: float | None = None) -> dict:
     """Scan results are remembered for 10 minutes."""
     entries = json.loads(log_json) if log_json else []
-    res = scan_pairs(list(pairs), [style], collateral, entries, workers=4)
+    res = scan_pairs(list(pairs), [style], collateral, entries, workers=4, leverage=leverage)
     res["time"] = datetime.now(timezone.utc).isoformat()
     return res
 
 
-def render_scan(style: str, collateral: float, entries: list[dict]):
+def render_scan(style: str, collateral: float, entries: list[dict], leverage: float | None = None):
     """Scan tab: check many pairs for the selected style and list the best side of each."""
-    lev = default_leverage(style)
+    lev = int(leverage) if leverage else default_leverage(style)
     all_pairs = st.checkbox(f"Scan all {len(SCAN_PAIRS)} pairs (slower)", key="scan_all")
     pairs = SCAN_PAIRS if all_pairs else SCAN_PAIRS[:SCAN_PAIRS_CLOUD]
-    html(f'<div class="note">Checks {len(pairs)} pairs for <b>{style}</b> at its suggested {lev}x, long and '
+    html(f'<div class="note">Checks {len(pairs)} pairs for <b>{style}</b> at {lev}x, long and '
          'short, with the same rules as the main screen. Results are kept for 10 minutes. '
          'Phone alerts come from Grok Bot\'s scheduled scan, not from this page.</div>')
-    key = f"scan_{style}_{len(pairs)}"
+    key = f"scan_{style}_{len(pairs)}_{lev}_{collateral}"
     try:
         clicked = st.button("Scan pairs", type="primary", width="stretch")
     except TypeError:
@@ -1716,7 +1716,7 @@ def render_scan(style: str, collateral: float, entries: list[dict]):
         with st.spinner(f"Scanning {len(pairs)} pairs - about {max(20, len(pairs) * 3)} seconds..."):
             try:
                 st.session_state[key] = cached_scan(style, tuple(pairs), float(collateral),
-                                                    json.dumps(entries, sort_keys=True))
+                                                    json.dumps(entries, sort_keys=True), float(lev))
             except Exception as e:
                 st.error(f"Scan failed ({type(e).__name__}). Please try again in a minute.")
     res = st.session_state.get(key)
@@ -1770,7 +1770,7 @@ def render_tabs(res, pair, style, collateral, leverage, entries, mode=DIRECTION_
     with t_journal:
         render_journal(entries, pair, style, decision)
     with t_scan:
-        render_scan(style, collateral, entries)
+        render_scan(style, collateral, entries, leverage)
 
 
 def main():
