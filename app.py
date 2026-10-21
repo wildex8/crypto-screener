@@ -30,6 +30,7 @@ All the maths lives in plain functions so it can be tested without the UI.
 
 from __future__ import annotations
 
+import html as _html
 import io
 import json
 import math
@@ -686,7 +687,8 @@ def run_backtest(df: pd.DataFrame, style: str, leverage: float, funding_rate: fl
     if not trades:
         res.update(win_rate=0.0, avg_win=0.0, avg_loss=0.0, exp_r=0.0, exp_pct=0.0, pf=0.0,
                    max_dd=0.0, total_ret=0.0, liquidations=0, wiped=False, long_n=0, short_n=0,
-                   equity=pd.DataFrame({"time": [period_start], "equity": [100.0]}))
+                   equity=pd.DataFrame({"time": [period_start], "equity": [100.0]}),
+                   sides={1: side_stats(None), -1: side_stats(None)})
         return res
     t = res["trades"]
     wins, losses = t[t["ret"] > 0], t[t["ret"] <= 0]
@@ -713,6 +715,8 @@ def run_backtest(df: pd.DataFrame, style: str, leverage: float, funding_rate: fl
         equity=pd.DataFrame({"time": eq_times, "equity": curve}),
         long_n=int((t["side"] == "LONG").sum()), short_n=int((t["side"] == "SHORT").sum()),
     )
+    # Separate stats for long-only and short-only trades (used by each side's decision).
+    res["sides"] = {1: side_stats(t[t["side"] == "LONG"]), -1: side_stats(t[t["side"] == "SHORT"])}
     return res
 
 
@@ -720,68 +724,91 @@ def run_backtest(df: pd.DataFrame, style: str, leverage: float, funding_rate: fl
 # 7. DECISION LOGIC
 # =============================================================================
 
+def side_stats(trades: pd.DataFrame | None) -> dict:
+    """Win rate / expectancy for a set of backtest trades (used per direction)."""
+    if trades is None or len(trades) == 0:
+        return dict(n=0, win_rate=0.0, exp_r=0.0, exp_pct=0.0, pf=0.0, avg_win=0.0, avg_loss=0.0)
+    w, lo = trades[trades["ret"] > 0], trades[trades["ret"] <= 0]
+    ls = lo["ret"].sum()
+    return dict(n=len(trades), win_rate=len(w) / len(trades) * 100,
+                exp_r=float(trades["r"].mean()), exp_pct=float(trades["ret"].mean() * 100),
+                pf=float(w["ret"].sum() / abs(ls)) if ls != 0 else float("inf"),
+                avg_win=float(w["ret"].mean() * 100) if len(w) else 0.0,
+                avg_loss=float(lo["ret"].mean() * 100) if len(lo) else 0.0)
+
+
 def decide(mtf: dict, style: str, leverage: float, position: dict, bt: dict | None,
-           learn_mult: float) -> dict:
-    """Combine everything into GO LONG / GO SHORT / NO-GO + confidence."""
+           learn_mult: float, direction: int = 1) -> dict:
+    """Evaluate ONE side (direction +1 = LONG, -1 = SHORT) and return its
+    GO / NO-GO verdict + confidence. Call it once per side.
+
+    position must be the position worked out for that same direction, and the
+    backtest stats used are the trades of that direction only (bt["sides"])."""
     cfg = STYLES[style]
-    score = mtf["score"]
-    direction = 1 if score >= 0 else -1
+    direction = 1 if direction >= 0 else -1
     word = "LONG" if direction == 1 else "SHORT"
+    score = mtf["score"]
+    aligned = score * direction          # positive = the charts support this side
     reasons, blockers = [], []
     prim, high = mtf["tfs"][mtf["primary"]], mtf["tfs"].get(mtf["higher"])
 
-    conf = min(92.0, 40 + abs(score) * 0.55)
-    reasons.append(f"Overall weighted score is {score:+.0f} out of 100 "
-                   f"({'bullish' if score > 0 else 'bearish' if score < 0 else 'neutral'}).")
+    conf = min(92.0, max(1.0, 40 + aligned * 0.55))
+    if aligned > 0:
+        reasons.append(f"Charts lean towards a {word} (score {score:+.0f} out of 100).")
+    if aligned < cfg["min_score"]:
+        if aligned <= -cfg["min_score"]:
+            blockers.append(f"Charts point the other way (score {score:+.0f}).")
+        else:
+            blockers.append(f"Signals are mixed (score {score:+.0f}; a {word} needs "
+                            f"{'+' if direction == 1 else '-'}{cfg['min_score']} or more).")
 
-    if abs(score) < cfg["min_score"]:
-        blockers.append(f"Signals are mixed (score {score:+.0f}; need at least ±{cfg['min_score']}).")
-
-    # --- Supertrend verification gate ---
+    # --- Supertrend verification gate (for this side) ---
     if prim["st_dir"] == direction:
-        reasons.append(f"✅ Supertrend on the main {mtf['primary']} chart agrees ({word}).")
+        reasons.append(f"✅ Main {mtf['primary']} Supertrend agrees.")
     else:
-        blockers.append(f"Supertrend on the main {mtf['primary']} chart disagrees with a {word}.")
+        blockers.append(f"Main {mtf['primary']} Supertrend disagrees.")
     if high is not None and mtf["higher"] != mtf["primary"]:
         if high["st_dir"] != direction and high["score"] * direction <= -40:
-            blockers.append(f"The bigger {mtf['higher']} chart strongly points the other way.")
+            blockers.append(f"Bigger {mtf['higher']} chart strongly points the other way.")
         elif high["st_dir"] != direction:
             conf *= 0.85
-            reasons.append(f"⚠️ The bigger {mtf['higher']} Supertrend points the other way (confidence reduced).")
+            reasons.append(f"⚠️ Bigger {mtf['higher']} Supertrend disagrees (confidence reduced).")
         else:
-            reasons.append(f"✅ The bigger {mtf['higher']} Supertrend agrees too.")
+            reasons.append(f"✅ Bigger {mtf['higher']} Supertrend agrees too.")
 
-    # --- backtest feedback ---
-    if bt is None:
+    # --- backtest feedback, using only this side's past trades ---
+    s = None
+    if bt is not None:
+        s = (bt.get("sides") or {}).get(direction) or bt
+    if s is None:
         conf *= 0.8
-        reasons.append("⚠️ Backtest could not run, so confidence is reduced.")
-    elif bt["n"] < 10:
-        conf *= 0.85 if bt["exp_r"] > 0 else 0.7
-        reasons.append(f"⚠️ Backtest found only {bt['n']} trades - low reliability.")
-    elif bt["exp_r"] <= 0 or bt["exp_pct"] <= 0 or bt.get("wiped"):
-        blockers.append(f"Backtest lost money after costs ({bt['exp_r']:+.2f}R, {bt['exp_pct']:+.2f}% per trade "
-                        f"over {bt['n']} trades).")
-    elif bt["exp_r"] < 0.1:
+        reasons.append("⚠️ Backtest could not run (confidence reduced).")
+    elif s["n"] < 10:
+        conf *= 0.85 if s["exp_r"] > 0 else 0.7
+        reasons.append(f"⚠️ Backtest had only {s['n']} {word} trades - low reliability.")
+    elif s["exp_r"] <= 0 or s["exp_pct"] <= 0 or (bt or {}).get("wiped"):
+        blockers.append(f"Past {word} trades lost money after costs ({s['exp_r']:+.2f}R, "
+                        f"{s['exp_pct']:+.2f}% per trade, {s['n']} trades).")
+    elif s["exp_r"] < 0.1:
         conf *= 0.85
-        reasons.append(f"⚠️ Backtest edge is thin ({bt['exp_r']:+.2f}R per trade) - confidence reduced.")
+        reasons.append(f"⚠️ Past {word} trades only just made money ({s['exp_r']:+.2f}R) - confidence reduced.")
     else:
-        if bt["exp_r"] >= 0.25 and bt["pf"] > 1.3:
+        if s["exp_r"] >= 0.25 and s["pf"] > 1.3:
             conf *= 1.05
-        reasons.append(f"✅ Backtest made {bt['exp_r']:+.2f}R per trade after costs ({bt['n']} trades, "
-                       f"{bt['win_rate']:.0f}% wins).")
+        reasons.append(f"✅ Past {word} trades made {s['exp_r']:+.2f}R each after costs "
+                       f"({s['n']} trades, {s['win_rate']:.0f}% wins).")
 
-    # --- leverage / liquidation checks ---
+    # --- leverage / liquidation checks (this side's position) ---
     lo, hi = cfg["lev_range"]
     if leverage > hi:
         conf *= 0.9
         reasons.append(f"⚠️ {leverage:.0f}x is above the {lo}-{hi}x range for {style} (confidence reduced).")
     if position["liq_before_stop"]:
-        blockers.append(f"At {leverage:.0f}x you would be LIQUIDATED before your stop. "
+        blockers.append(f"At {leverage:.0f}x you'd be LIQUIDATED before the stop. "
                         f"Use {position['max_safe_lev']}x or less.")
     elif position["liq_close"]:
         conf *= 0.85
         reasons.append(f"⚠️ Liquidation is close to the stop. Safer: {position['max_safe_lev']}x or less.")
-
     if position["rr_after_costs"] < 1.0:
         blockers.append(f"After costs the reward is smaller than the risk (R:R {position['rr_after_costs']:.2f}).")
 
@@ -794,12 +821,28 @@ def decide(mtf: dict, style: str, leverage: float, position: dict, bt: dict | No
     if not blockers and conf < MIN_CONFIDENCE_FOR_GO:
         blockers.append(f"Confidence {conf:.0f}% is below the {MIN_CONFIDENCE_FOR_GO}% needed for a GO.")
     if blockers:
-        conf = min(conf, 49.0)
+        conf = min(conf, 49.0)            # a NO-GO never shows more than 49%
         verdict = "NO-GO"
     else:
         verdict = f"GO {word}"
-    return dict(verdict=verdict, direction=direction, confidence=round(conf),
-                reasons=reasons, blockers=blockers, score=score)
+    return dict(verdict=verdict, direction=direction, side=word, confidence=round(conf),
+                reasons=reasons, blockers=blockers, score=score, aligned=aligned)
+
+
+DIRECTION_MODES = ["Auto (best side)", "Long", "Short"]
+
+
+def pick_side(decisions: dict, mode: str) -> int:
+    """Which side the main banner shows.
+    Long / Short -> that side. Auto -> the side with the higher confidence
+    (on a tie a GO wins; if both are NO-GO the banner simply says NO-GO)."""
+    if mode == "Long":
+        return 1
+    if mode == "Short":
+        return -1
+    lg, sh = decisions[1], decisions[-1]
+    key = lambda d: (d["confidence"], d["verdict"] != "NO-GO", d["aligned"])
+    return 1 if key(lg) >= key(sh) else -1
 
 
 # =============================================================================
@@ -856,19 +899,28 @@ def _bayes_wr(wins: int, n: int, prior: float = 0.5, strength: float = 10.0) -> 
     return (wins + prior * strength) / (n + strength)
 
 
-def learning_multiplier(entries: list[dict], style: str, pair: str) -> tuple[float, str]:
-    """Bounded confidence multiplier (0.80 - 1.15) from your logged results."""
+def learning_multiplier(entries: list[dict], style: str, pair: str,
+                        direction: int | None = None) -> tuple[float, str]:
+    """Bounded confidence multiplier (0.80 - 1.15) from your logged results.
+    Uses the style's results; blends in that pair (5+ results) and, when a
+    direction is given, that direction's results for the style (5+ results)."""
     pair = re.sub(r"[^A-Z0-9]", "", pair.upper())
     s = [e for e in entries if e.get("style") == style]
     if not s:
         return 1.0, f"No {style} results logged yet - no adjustment."
-    wr = _bayes_wr(sum(e["outcome"] == "Win" for e in s), len(s))
-    note = f"{style}: {len(s)} results, adjusted win rate {wr * 100:.0f}%"
+    rates = [_bayes_wr(sum(e["outcome"] == "Win" for e in s), len(s))]
+    note = f"{style}: {len(s)} results, adjusted win rate {rates[0] * 100:.0f}%"
     p = [e for e in s if e.get("pair") == pair]
     if len(p) >= 5:
-        pwr = _bayes_wr(sum(e["outcome"] == "Win" for e in p), len(p))
-        wr = (wr + pwr) / 2
-        note += f"; {pair}: {len(p)} results, adjusted {pwr * 100:.0f}%"
+        rates.append(_bayes_wr(sum(e["outcome"] == "Win" for e in p), len(p)))
+        note += f"; {pair}: {len(p)} results, adjusted {rates[-1] * 100:.0f}%"
+    if direction in (1, -1):
+        word = "LONG" if direction == 1 else "SHORT"
+        dd = [e for e in s if str(e.get("direction", "")).upper() == word]
+        if len(dd) >= 5:
+            rates.append(_bayes_wr(sum(e["outcome"] == "Win" for e in dd), len(dd)))
+            note += f"; {word}: {len(dd)} results, adjusted {rates[-1] * 100:.0f}%"
+    wr = sum(rates) / len(rates)
     mult = float(min(1.15, max(0.80, 1 + (wr - 0.5))))
     return mult, note + f" -> x{mult:.2f}"
 
@@ -881,7 +933,9 @@ def to_local(ts: pd.Series) -> pd.Series:
     return ts.dt.tz_convert(LOCAL_TZ)
 
 
-def price_chart(d: pd.DataFrame, pair: str, tf: str) -> go.Figure:
+def price_chart(d: pd.DataFrame, pair: str, tf: str, pos: dict | None = None) -> go.Figure:
+    """Candles + Supertrend + EMAs, volume and RSI. If pos is given, the entry, stop,
+    target (and liquidation, when it is inside the visible range) are drawn as lines."""
     d = d.tail(CHART_BARS).copy()
     x = to_local(d["time"])
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
@@ -906,6 +960,18 @@ def price_chart(d: pd.DataFrame, pair: str, tf: str) -> go.Figure:
                              line=dict(color="#e5e7eb", width=1), showlegend=False), row=3, col=1)
     for lvl in (70, 30):
         fig.add_hline(y=lvl, line=dict(color="#6b7280", width=1, dash="dot"), row=3, col=1)
+    if pos:
+        side = "LONG" if pos["direction"] == 1 else "SHORT"
+        lo_vis, hi_vis = float(d["low"].min()), float(d["high"].max())
+        span = hi_vis - lo_vis
+        levels = [("Entry", pos["entry"], "#e5e7eb", "dot"), ("Stop", pos["stop"], "#ef4444", "dash"),
+                  ("Target", pos["target"], "#22c55e", "dash")]
+        if lo_vis - span * 0.3 <= pos["liq"] <= hi_vis + span * 0.3:   # only if it won't squash the chart
+            levels.append(("Liquidation", pos["liq"], "#f97316", "dashdot"))
+        for name, y, col, dash in levels:
+            fig.add_hline(y=y, line=dict(color=col, width=1.2, dash=dash), row=1, col=1,
+                          annotation_text=f"{side} {name} {fmt_price(y)}", annotation_position="top left",
+                          annotation_font=dict(size=9, color=col))
     fig.update_layout(
         template="plotly_dark", height=580, margin=dict(l=4, r=4, t=30, b=4),
         title=dict(text=f"{pair} · {tf} · {LOCAL_TZ_LABEL}", font=dict(size=13), x=0.01),
@@ -948,6 +1014,15 @@ div[data-testid="stMetricLabel"] p {font-size: 0.8rem;}
 .go {background:#065f46; border:2px solid #22c55e; color:#ecfdf5;}
 .nogo {background:#7f1d1d; border:2px solid #ef4444; color:#fef2f2;}
 button[data-baseweb="tab"] {padding-left:8px; padding-right:8px;}
+.banner .sub {font-size:0.85rem; margin-top:4px; opacity:0.85;}
+.cards {display:flex; flex-wrap:wrap; gap:8px; margin:4px 0 12px 0;}
+.card {flex:1 1 150px; min-width:150px; border-radius:12px; padding:10px 10px 6px 10px;}
+.card.picked {box-shadow:0 0 0 3px #facc15;}
+.card .side {font-size:0.8rem; font-weight:700; letter-spacing:1px; opacity:0.85;}
+.card .cverdict {font-size:1.4rem; font-weight:800; line-height:1.15;}
+.card .cconf {font-size:1.05rem; margin-bottom:4px;}
+.card ul {margin:0; padding-left:1.05rem; font-size:0.78rem; line-height:1.3;}
+.card li {margin-bottom:3px;}
 </style>
 """
 
@@ -1102,18 +1177,18 @@ def render_learning(entries, pair, style, decision):
 
 
 def run_analysis(pair, style, collateral, leverage, st_period, st_mult, entries):
-    """Do all the work. Returns a dict with everything the tabs need."""
+    """Do all the work for BOTH sides. Returns a dict with everything the tabs need."""
     cfg = STYLES[style]
-    out = dict(mtf=None, bt=None, pos=None, decision=None, bt_note=None,
+    out = dict(mtf=None, bt=None, pos={}, decisions={}, bt_note=None,
                funding=(DEFAULT_FUNDING_8H, "estimate (0.01% per 8h)", True))
     with st.spinner("Downloading prices and analysing..."):
         mtf = multi_timeframe(pair, style, st_period, st_mult)
         out["funding"] = fetch_funding(pair)
         prim = mtf["tfs"][mtf["primary"]]
-        direction = 1 if mtf["score"] >= 0 else -1
-        pos = compute_position(collateral, leverage, prim["close"], prim["atr"], direction,
-                               style, out["funding"][0])
-        out.update(mtf=mtf, pos=pos)
+        out["mtf"] = mtf
+        # Long and short have different stops, targets and liquidation prices.
+        out["pos"] = {d: compute_position(collateral, leverage, prim["close"], prim["atr"], d,
+                                          style, out["funding"][0]) for d in (1, -1)}
     with st.spinner("Running the 12-month backtest (the first run can take ~30 seconds)..."):
         try:
             hist, hist_src, _ = fetch_history(pair, cfg["primary"], cfg["bt_candles"])
@@ -1125,16 +1200,35 @@ def run_analysis(pair, style, collateral, leverage, st_period, st_mult, entries)
                 out["bt"] = bt
         except Exception as e:  # a backtest problem shouldn't stop everything else
             out["bt_note"] = f"Backtest could not run ({type(e).__name__})."
-    mult, _ = learning_multiplier(entries, style, pair)
-    out["decision"] = decide(mtf, style, leverage, pos, out["bt"], mult)
+    for d in (1, -1):
+        mult, _ = learning_multiplier(entries, style, pair, d)
+        out["decisions"][d] = decide(mtf, style, leverage, out["pos"][d], out["bt"], mult, d)
     return out
 
 
-def render_tabs(res, pair, style, collateral, leverage, entries):
+def side_card_html(dec: dict, highlighted: bool) -> str:
+    """One small card (LONG or SHORT) for the side-by-side view."""
+    cls = "go" if dec["verdict"].startswith("GO") else "nogo"
+    verdict = dec["verdict"] if dec["verdict"].startswith("GO") else "NO-GO"
+    items = [f"❌ {b}" for b in dec["blockers"][:3]]
+    items += [r for r in dec["reasons"] if r.startswith("✅")][: max(0, 3 - len(items))]
+    lis = "".join(f"<li>{_html.escape(t)}</li>" for t in items)
+    star = " ★" if highlighted else ""
+    return (f'<div class="card {cls}{" picked" if highlighted else ""}">'
+            f'<div class="side">{dec["side"]}{star}</div><div class="cverdict">{verdict}</div>'
+            f'<div class="cconf">{dec["confidence"]}%</div><ul>{lis}</ul></div>')
+
+
+def render_tabs(res, pair, style, collateral, leverage, entries, mode=DIRECTION_MODES[0]):
     cfg = STYLES[style]
     lo, hi = cfg["lev_range"]
-    mtf, bt, pos, decision = res["mtf"], res["bt"], res["pos"], res["decision"]
+    mtf, bt, decisions = res["mtf"], res["bt"], res["decisions"]
     funding_rate, funding_src, funding_est = res["funding"]
+    # The side the user chose (or the best side in Auto) drives the banner,
+    # the Position tab, the chart's stop/target lines and the learning default.
+    chosen = pick_side(decisions, mode) if decisions else 1
+    decision = decisions.get(chosen) if decisions else None
+    pos = res["pos"].get(chosen) if res["pos"] else None
 
     tabs = st.tabs(["🎯 Decision", "📊 Chart", "💰 Position", "🔍 Analysis",
                     "🧪 Backtest", "🧠 Learning", "⚠️ Warnings"])
@@ -1143,16 +1237,27 @@ def render_tabs(res, pair, style, collateral, leverage, entries):
     with tabs[0]:
         if decision:
             cls = "go" if decision["verdict"].startswith("GO") else "nogo"
+            how = "best side" if mode.startswith("Auto") else "your choice"
             st.markdown(f'<div class="banner {cls}"><div class="verdict">{decision["verdict"]}</div>'
-                        f'<div class="conf">Confidence {decision["confidence"]}%</div></div>',
+                        f'<div class="conf">Confidence {decision["confidence"]}%</div>'
+                        f'<div class="sub">Showing the {decision["side"]} side ({how})</div></div>',
                         unsafe_allow_html=True)
+            st.markdown("**Long vs Short** - each side is checked separately:")
+            st.markdown('<div class="cards">' + side_card_html(decisions[1], chosen == 1)
+                        + side_card_html(decisions[-1], chosen == -1) + "</div>", unsafe_allow_html=True)
             if decision["blockers"]:
-                st.markdown("**Why NO-GO:**")
+                st.markdown(f"**Why the {decision['side']} side is NO-GO:**")
                 for b in decision["blockers"]:
                     st.markdown(f"- ❌ {b}")
-            st.markdown("**What the app saw:**")
+            st.markdown(f"**What the app saw for {decision['side']}:**")
             for r in decision["reasons"][:8]:
                 st.markdown(f"- {r}")
+            other = decisions[-chosen]
+            with st.expander(f"All reasons for the {other['side']} side ({other['verdict']}, {other['confidence']}%)"):
+                for b in other["blockers"]:
+                    st.markdown(f"- ❌ {b}")
+                for r in other["reasons"]:
+                    st.markdown(f"- {r}")
             metric_pairs([("Price now", fmt_price(pos["entry"])),
                           ("Score", f"{decision['score']:+.0f} / 100")])
             last_t = mtf["tfs"][mtf["primary"]]["last_time"].tz_convert(LOCAL_TZ)
@@ -1166,8 +1271,11 @@ def render_tabs(res, pair, style, collateral, leverage, entries):
     # ---------------- Chart ----------------
     with tabs[1]:
         if mtf:
-            show_fig(price_chart(mtf["tfs"][mtf["primary"]]["data"], pair, mtf["primary"]))
+            show_fig(price_chart(mtf["tfs"][mtf["primary"]]["data"], pair, mtf["primary"], pos))
+            side_txt = decision["side"] if decision else "LONG"
             st.caption("Green/red line = Supertrend. Thin coloured lines = EMAs 9/21/50/200. "
+                       f"Dashed lines = entry, stop and target for the {side_txt} side "
+                       "(liquidation too, if it's close enough to show). "
                        "Middle = volume. Bottom = RSI (above 70 overbought, below 30 oversold). "
                        "Pinch to zoom, drag to move. Prices are cached for 60 seconds - tap "
                        "**Refresh data** for the newest.")
@@ -1177,6 +1285,9 @@ def render_tabs(res, pair, style, collateral, leverage, entries):
         if pos:
             side = "LONG" if pos["direction"] == 1 else "SHORT"
             st.markdown(f"**If you opened a {side} now** (isolated margin, {leverage}x):")
+            st.caption("Long and short have different stop, target and liquidation prices. "
+                       "This tab follows the **Show side** switch at the top (in Auto it shows the "
+                       "side with the higher confidence).")
             metric_pairs([
                 ("Position size", usd(pos["notional"])), ("Quantity", f"{pos['qty']:.6g} coins"),
                 ("Entry (now)", fmt_price(pos["entry"])), ("Liquidation ≈", fmt_price(pos["liq"])),
@@ -1222,8 +1333,10 @@ def render_tabs(res, pair, style, collateral, leverage, entries):
                                  f"weight {r['weight'] * 100:.0f}%", expanded=(tf == mtf["primary"])):
                     for row in r["rows"]:
                         st.markdown(f"{_arrow(row['pts'])} **{row['factor']}** ({row['pts']:+.0f}) - {row['text']}")
-            st.caption("Supertrend is the key check: a GO needs the main timeframe's Supertrend to agree, "
-                       "and the biggest timeframe must not strongly disagree.")
+            st.caption("A positive score helps the LONG side and a negative score helps the SHORT side, "
+                       "so the same analysis gives the two sides opposite strength. "
+                       "Supertrend is the key check: a side can only be GO if the main timeframe's "
+                       "Supertrend points its way and the biggest timeframe doesn't strongly disagree.")
 
     # ---------------- Backtest ----------------
     with tabs[4]:
@@ -1249,6 +1362,13 @@ def render_tabs(res, pair, style, collateral, leverage, entries):
                 ("Total return", f"{bt['total_ret']:+.1f}%", "whole account used on every trade"),
                 ("Liquidations", str(bt["liquidations"])),
             ])
+            st.markdown("**Long trades vs short trades** (each side's decision uses its own results):")
+            for d_, nm in ((1, "Long"), (-1, "Short")):
+                s_ = bt["sides"][d_]
+                metric_pairs([(f"{nm} trades · win rate", f"{s_['n']} · {s_['win_rate']:.0f}%",
+                               "fewer than 10 trades = low reliability"),
+                              (f"{nm} expectancy", f"{s_['exp_r']:+.2f} R · {s_['exp_pct']:+.2f}%",
+                               "average result per trade after costs")])
             if bt["wiped"]:
                 st.error("💥 With these settings the backtest account was wiped out.")
             show_fig(equity_chart(bt))
@@ -1315,7 +1435,13 @@ def main():
         st.session_state.learning_log = load_log()
     entries = st.session_state.learning_log
 
-    res = dict(mtf=None, bt=None, pos=None, decision=None, bt_note=None,
+    # Which side the big banner / Position tab / chart lines / learning default follow.
+    # Outside the settings form so switching is instant (no re-download).
+    mode = st.radio("Show side", DIRECTION_MODES, horizontal=True, key="direction_mode",
+                    help="Auto shows whichever side (long or short) has the higher confidence. "
+                         "The Long and Short cards always show both.")
+
+    res = dict(mtf=None, bt=None, pos={}, decisions={}, bt_note=None,
                funding=(DEFAULT_FUNDING_8H, "estimate", True))
     try:
         res = run_analysis(pair, style, collateral, leverage, st_period, st_mult, entries)
@@ -1329,7 +1455,7 @@ def main():
             st.code(f"{type(e).__name__}: {str(e)[:300]}")
 
     try:
-        render_tabs(res, pair, style, collateral, leverage, entries)
+        render_tabs(res, pair, style, collateral, leverage, entries, mode)
     except Exception as e:
         st.error("😕 Part of the page couldn't be shown. Tap Refresh data to try again.")
         with st.expander("Technical details (for troubleshooting)"):

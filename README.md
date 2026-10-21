@@ -126,23 +126,29 @@ Don't upload `screenshot_mobile.png`. It's only a preview picture.
 
 If your leverage is outside the suggested range, you'll see a warning.
 
-**🎯 Decision.** The big banner.
+**Show side (Auto / Long / Short).** A switch just under the settings.
+- **Auto (best side)**: the big banner shows whichever side, long or short, has the higher confidence. If both are NO-GO, it simply says NO-GO.
+- **Long** or **Short**: the big banner, the Position tab, the stop/target lines on the chart and the "Log a result" direction all follow the side you picked.
+
+**🎯 Decision.** The big banner, then two smaller cards, **LONG** and **SHORT**, side by side. Each side is checked separately and gets its own verdict and confidence. The side the banner is showing has a yellow outline and a ★.
 - **GO LONG** means the signals point up: a bet the price rises.
 - **GO SHORT** means the signals point down: a bet the price falls.
-- **NO-GO** means don't trade this setup now. The reasons are listed underneath.
-- **Confidence %** shows how strongly everything agrees (charts, Supertrend, backtest, your own results). Under 55% is always NO-GO. Even 80% is **not** a guarantee.
+- **NO-GO** means don't trade that side now. The reasons are listed on its card.
+- **Confidence %** shows how strongly everything agrees for that side. Under 55% is always NO-GO, and a NO-GO never shows more than 49%. Even 80% is **not** a guarantee.
 
-A GO needs all of these:
-1. a clear overall score
-2. the **Supertrend** on the main chart agreeing (the key check)
-3. the biggest chart not strongly disagreeing
-4. a backtest that made money after costs
-5. no liquidation before your stop
-6. a reward bigger than the risk after costs
+Usually one side looks reasonable and the other looks poor: if the charts lean up, the long side scores higher and the short side scores lower. Often both are NO-GO, which simply means "no good trade right now".
+
+A side can only be GO if all of these are true:
+1. the overall score clearly points its way
+2. the **Supertrend** on the main chart agrees (the key check)
+3. the biggest chart doesn't strongly disagree
+4. past trades **in that direction** made money after costs in the backtest
+5. you wouldn't be liquidated before your stop
+6. the reward is bigger than the risk after costs
 
 **📊 Chart.** Candles with the **Supertrend** (green = up-trend, red = down-trend) and the EMA lines. Volume is in the middle and **RSI** at the bottom (above 70 = stretched up, below 30 = stretched down). Pinch to zoom. Times are Sri Lanka time.
 
-**💰 Position.**
+**💰 Position.** Shows the side chosen with the **Show side** switch (in Auto, the stronger side). A long's stop sits below the price and a short's above it, so the numbers change with the side.
 - Your position size (collateral × leverage) and the number of coins.
 - The suggested stop-loss and take-profit.
 - The estimated **liquidation price**: the price at which the exchange closes your trade and you lose the collateral.
@@ -151,7 +157,7 @@ A GO needs all of these:
 
 **🔍 Analysis.** Every indicator on every timeframe, explained in one line each, with the points it added or took away.
 
-**🧪 Backtest.** How the same rules would have done in the past, at your leverage and with all costs included:
+**🧪 Backtest.** How the same rules would have done in the past, at your leverage and with all costs included. Long trades and short trades are also shown separately, because each side's decision uses only its own past trades:
 - number of trades and win rate
 - average win and loss
 - **expectancy**: the average result per trade (above 0 is good)
@@ -161,7 +167,7 @@ A GO needs all of these:
 
 Scalp tests only the last few weeks of 5-minute candles to stay quick. The exact dates tested are shown.
 
-**🧠 Learning.** Log **Win** or **Loss** after each trade. The app shrinks confidence a little for styles and pairs that keep losing for you, and raises it slightly (up to +15%) for ones that win. Remember to **download the CSV backup**.
+**🧠 Learning.** Log **Win** or **Loss** after each trade, with its direction. The app shrinks confidence a little for styles, pairs and directions (long or short) that keep losing for you, and raises it slightly (up to +15%) for ones that win. Remember to **download the CSV backup**.
 
 **⚠️ Warnings.** The important risks, in one place.
 
