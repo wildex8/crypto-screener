@@ -611,6 +611,52 @@ def open_view(t, now):
                 last_checked_uae=uae(t["last_checked"]) if t.get("last_checked") else None)
 
 
+def account_state(trades_doc, now, extra_open=None) -> dict | None:
+    """Practice account: starting balance + realised P&L after costs (no compounding: size stays fixed).
+    Returns None when no account has been set (--starting-balance)."""
+    acc = trades_doc.get("account")
+    if not acc or acc.get("starting_balance") is None:
+        return None
+    start = float(acc["starting_balance"])
+    since = parse_t(acc["start_time"]) if acc.get("start_time") else None
+    inside = [t for t in trades_doc["trades"] if since is None or parse_t(t["opened_at"]) >= since]
+    closed = [t for t in inside if t["status"] == "closed"]
+    opens = [t for t in inside if t["status"] == "open"]
+    realised = sum(t["pnl_usd"] for t in closed)
+    value = start + realised
+    in_use = sum(t.get("collateral", COLLATERAL) for t in opens)
+    unr = [unrealised(t, now) for t in opens]
+    unr_usd = sum(u["pnl_usd"] for u in unr if u)
+    equity = value + unr_usd
+    free = value - in_use
+    return dict(
+        starting_balance_usd=r2(start), start_uae=uae(acc["start_time"]) if acc.get("start_time") else None,
+        realised_pnl_usd=r2(realised), account_value_usd=r2(value),
+        collateral_in_use_usd=r2(in_use), open_trades=len(opens), free_cash_usd=r2(free),
+        unrealised_pnl_usd=r2(unr_usd), equity_usd=r2(equity),
+        return_pct=r2((value - start) / start * 100), equity_return_pct=r2((equity - start) / start * 100),
+        collateral_per_trade_usd=COLLATERAL, can_open_new_trade=free >= COLLATERAL,
+        sizing="fixed $1,000 collateral ($5,000 at 5x) per trade - not compounding yet")
+
+
+def has_free_cash(trades_doc, now) -> bool:
+    a = account_state(trades_doc, now)
+    return a is None or a["free_cash_usd"] >= COLLATERAL - 1e-9
+
+
+def set_starting_balance(ledger: "Ledger", amount: float, start_time: str | None = None) -> dict:
+    """Store the practice account in trades.json (backed up first). Start = first practice trade if not given.
+    Trades, processed signals and learning are not touched."""
+    trades_doc, learning = ledger.load()
+    if start_time is None:
+        ts = [t["opened_at"] for t in trades_doc["trades"]]
+        start_time = min(ts, key=parse_t) if ts else utcnow().isoformat()
+    trades_doc["account"] = dict(starting_balance=float(amount), start_time=start_time,
+                                 set_at=utcnow().isoformat(), sizing="fixed", collateral_per_trade=COLLATERAL)
+    ledger._write(ledger.trades_path, trades_doc)
+    return account_state(trades_doc, utcnow())
+
+
 def totals(trades_doc, now):
     closed = [t for t in trades_doc["trades"] if t["status"] == "closed"]
     opens = [t for t in trades_doc["trades"] if t["status"] == "open"]
@@ -632,7 +678,7 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
     funding_fn = funding_fn or fetch_funding
     trades_doc, learning = ledger.load()
     out = dict(ledger=str(ledger.root), run_time_uae=uae(now), opened=[], closed=[], not_opened=[],
-               open_trades=[], totals={}, learning={}, warnings=[])
+               open_trades=[], totals={}, account=None, learning={}, warnings=[])
 
     # 1. update open trades
     for t in [t for t in trades_doc["trades"] if t["status"] == "open"]:
@@ -703,6 +749,13 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
             out["not_opened"].append(dict(pair=sig["pair"], style=sig["style"], side=sig["side"],
                                           why="a paper trade for this pair + style is already open"))
             continue
+        if not has_free_cash(trades_doc, now):
+            a = account_state(trades_doc, now)
+            out["not_opened"].append(dict(pair=sig["pair"], style=sig["style"], side=sig["side"],
+                                          confidence=sig.get("confidence"), entry_tf=sig.get("timeframe"),
+                                          why="not enough free cash", reason="not enough free cash",
+                                          free_cash_usd=a["free_cash_usd"], needed_usd=COLLATERAL))
+            continue
         t = open_trade(s2, now, feats, tags, probe=verdict["probe"], funding=fr,
                        required=verdict["required_confidence"])
         trades_doc["trades"].append(t)
@@ -723,6 +776,7 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
 
     out["open_trades"] = [open_view(t, now) for t in trades_doc["trades"] if t["status"] == "open"]
     out["totals"] = totals(trades_doc, now)
+    out["account"] = account_state(trades_doc, now)
     out["learning"] = dict(
         skipped=skipped, probes=probes, changes=changes,
         active_rules=[dict(bucket=k, label=bucket_label(k), min_confidence=BASE_MIN_CONF + b["penalty"],
@@ -784,6 +838,9 @@ def seed_from_state(ledger: Ledger, state_path: Path, now=None, day_uae: str | N
         if any(t["status"] == "open" and t["pair"] == pair and t["style"] == style for t in trades_doc["trades"]):
             item["opened"], item["why"] = False, "already open"
             continue
+        if not has_free_cash(trades_doc, now):
+            item["opened"], item["why"] = False, "not enough free cash"
+            continue
         s = r["long"] if side == "LONG" else r["short"]
         sig = dict(pair=pair, style=style, side=side, confidence=s["confidence"], entry=s["entry"], stop=s["stop"],
                    target=s["target"], backtest_expectancy_r=s["bt_exp_r"], backtest_trades=s["bt_n"],
@@ -813,6 +870,17 @@ def summary_text(ledger: Ledger, now=None) -> str:
     trades_doc, learning = ledger.load()
     tot = totals(trades_doc, now)
     L = [f"PRACTICE TRADING (paper money, $5,000 at 5x per trade) · {uae(now)}", ""]
+    acc = account_state(trades_doc, now)
+    if acc:
+        L.append(f"Account: ${acc['account_value_usd']:,.2f} ({acc['return_pct']:+.2f}% on "
+                 f"${acc['starting_balance_usd']:,.0f} since {acc['start_uae']}) · free cash ${acc['free_cash_usd']:,.2f} · "
+                 f"in trades ${acc['collateral_in_use_usd']:,.0f} ({acc['open_trades']} open) · equity "
+                 f"${acc['equity_usd']:,.2f} ({acc['equity_return_pct']:+.2f}%)")
+        if not acc["can_open_new_trade"]:
+            L.append("  New trades are paused until $1,000 is free.")
+        L.append("")
+    else:
+        L += ["Account: no starting balance set (use --starting-balance).", ""]
     if tot["closed_trades"]:
         L.append(f"Closed trades: {tot['closed_trades']} · won {tot['wins']} · lost {tot['losses']} · "
                  f"win rate {tot['win_rate_pct']:.0f}% · total P&L ${tot['total_pnl_usd']:+,.2f} after costs "
@@ -861,9 +929,20 @@ def main(argv=None) -> int:
     ap.add_argument("--summary", action="store_true", help="print a plain summary")
     ap.add_argument("--seed-from-state", help="open paper trades for today's alerts in this state.json "
                                               "if still GO (state file is only read)")
+    ap.add_argument("--starting-balance", type=float, help="set the practice account's starting balance (USD), "
+                    "counted from the first practice trade unless --account-start is given")
+    ap.add_argument("--account-start", help="ISO time the account starts (default: first practice trade)")
     ap.add_argument("--allow-no-dedupe", action="store_true", help="open trades even if the scan used --no-state (tests)")
     a = ap.parse_args(argv)
     led = Ledger(a.ledger)
+    if a.starting_balance is not None:
+        led.lock()
+        try:
+            print(json.dumps(set_starting_balance(led, a.starting_balance, a.account_start), indent=2, default=str))
+        finally:
+            led.unlock()
+        if not (a.run or a.seed_from_state or a.summary):
+            return 0
     if a.summary and not (a.run or a.seed_from_state):
         print(summary_text(led))
         return 0
