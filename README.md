@@ -178,11 +178,38 @@ Below that are four tabs:
 
 ---
 
+## Scanner: checking many pairs at once
+
+**In the app:** open the **Scan** tab and tap **Scan pairs**. It checks the 12 most-traded pairs for your chosen style (tick **Scan all 28 pairs** for the full list, which is slower). It uses the style's suggested leverage (Swing 3x, Day 5x) and exactly the same long and short checks as the main screen. You get a sorted list showing each pair's best side and confidence, with any **GO** highlighted in green. Results are kept for 10 minutes.
+
+**Phone alerts:** these come from **Grok Bot**, not from the Streamlit app. Grok Bot runs the scanner on its own computer every hour and messages you when a pair gets a **new** confirmed GO LONG or GO SHORT for the Day or Swing style. "New" means it hasn't alerted you about the same pair, style and side in the last 12 hours, unless the signal went away and came back. Each alert includes:
+- entry, stop, target and liquidation (at the suggested leverage)
+- reward-to-risk after costs
+- the top reasons
+- how that side did in the backtest
+
+Pairs scanned by default: BTC, ETH, SOL, BNB, XRP, DOGE, ADA, AVAX, LINK, TON, DOT, LTC, BCH, NEAR, SUI, APT, ARB, OP, INJ, TRX, PENGU, ZEC, HYPE, PUMP, PEPE, WIF, ENA and TAO (all against USDT). If a coin isn't on Binance, or Binance only has a short history for it, the app automatically uses Bybit, OKX, KuCoin, Coinbase or Kraken instead. Newer coins with less than 12 months of history get the usual "low reliability" handling.
+
+For the technically curious, the scanner is the `scanner.py` file:
+```
+python scanner.py --styles Day,Swing --all --no-state
+```
+Useful options:
+- `--pairs BTCUSDT,ETHUSDT`
+- `--collateral 100`
+- `--json`
+- `--state FILE` (sets the file used to remember what has already been alerted)
+
+As always: **not financial advice.** A GO is a set of conditions lining up, not a promise.
+
+---
+
 ## Files in this folder
 
 | File | What it is |
 |---|---|
 | `app.py` | The whole app |
+| `scanner.py` | The multi-pair scanner (used for Grok Bot's alerts; optional on Streamlit Cloud) |
 | `requirements.txt` | The list of parts Streamlit installs |
 | `.streamlit/config.toml` | Dark theme (optional) |
 | `README.md` | This guide |

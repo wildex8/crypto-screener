@@ -67,8 +67,12 @@ LIVE_BARS = 500                # candles downloaded per timeframe for the live a
 CHART_BARS = 150               # candles drawn on the chart (keeps it readable on a phone)
 MIN_CONFIDENCE_FOR_GO = 55     # below this the answer is always NO-GO
 
-POPULAR_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-                 "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "LTCUSDT"]
+# Pairs offered in the picker and scanned by default (majors first, then the user's extras).
+# Pairs not on Binance (e.g. HYPE, PUMP) are served automatically by Bybit / OKX / KuCoin etc.
+POPULAR_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT",
+                 "AVAXUSDT", "LINKUSDT", "TONUSDT", "DOTUSDT", "LTCUSDT", "BCHUSDT", "NEARUSDT",
+                 "SUIUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "INJUSDT", "TRXUSDT",
+                 "PENGUUSDT", "ZECUSDT", "HYPEUSDT", "PUMPUSDT", "PEPEUSDT", "WIFUSDT", "ENAUSDT", "TAOUSDT"]
 
 INTERVAL_SECONDS = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400,
                     "1d": 86400, "1w": 604800}
@@ -289,9 +293,15 @@ def _paginate(src, sym, iv, n, budget_s) -> pd.DataFrame:
 
 
 def load_klines(pair: str, interval: str, n: int, budget_s: float = 20.0):
-    """Try every source in order. Returns (df, source_name, errors)."""
+    """Try every source in order. Returns (df, source_name, errors).
+
+    For long downloads (more than LIVE_BARS candles, i.e. backtest history), a source
+    that only has a short history (e.g. a coin listed recently on Binance but older
+    on OKX) doesn't win automatically: up to 3 more sources are tried and the longest
+    history is kept. If none has ~12 months, the longest available is used."""
     base, quote = parse_pair(pair)
-    errors = []
+    errors, best, extra_tries = [], None, 0
+    want_long = n > LIVE_BARS
     for src in SOURCES:
         native, factor, rule = interval, 1, None
         if interval not in src["ivs"]:
@@ -306,9 +316,21 @@ def load_klines(pair: str, interval: str, n: int, budget_s: float = 20.0):
                     df = _resample(df, rule).tail(n).reset_index(drop=True)
                 if len(df) < 2:
                     raise DataError("too few candles")
-                return df, f"{src['name']} ({sym})", errors
+                found = (df, f"{src['name']} ({sym})")
+                if not want_long or len(df) >= 0.8 * n:
+                    if best is None or len(df) >= len(best[0]):
+                        return found[0], found[1], errors
+                    return best[0], best[1], errors
+                if best is None or len(df) > len(best[0]):
+                    best = found
+                extra_tries += 1
+                break                   # try the next source
             except Exception as e:  # network error, unknown symbol, geo-block ...
                 errors.append(f"{src['name']} {sym}: {str(e)[:120]}")
+        if best is not None and extra_tries > 3:
+            break
+    if best is not None:
+        return best[0], best[1], errors
     return None, None, errors
 
 
@@ -1020,6 +1042,139 @@ def equity_chart(bt: dict) -> go.Figure:
 
 
 # =============================================================================
+# 9b. MULTI-PAIR SCANNER CORE  (used by scanner.py and the Scan tab)
+# =============================================================================
+# Evaluates long AND short for each pair and style with exactly the same
+# multi_timeframe() -> compute_position() -> run_backtest() -> decide() chain
+# as the main screen. Each timeframe is downloaded once per pair and reused
+# across styles (e.g. 4h is used by both Day and Swing).
+
+SCAN_PAIRS = list(POPULAR_PAIRS)   # 28 pairs
+SCAN_PAIRS_CLOUD = 12          # the Scan tab checks only the first 12 by default (keeps it quick)
+
+
+def default_leverage(style: str) -> int:
+    """Middle of the style's suggested range (Swing 3x, Day 5x, Scalp 10x)."""
+    lo, hi = STYLES[style]["lev_range"]
+    return int((lo + hi) // 2)
+
+
+def _plain_reasons(dec: dict, k: int = 2) -> list[str]:
+    return [t for _, t in _reason_items(dec)][:k]
+
+
+def _side_summary(dec: dict, pos: dict, bt: dict | None) -> dict:
+    s = (bt or {}).get("sides", {}).get(dec["direction"]) if bt else None
+    return dict(verdict=dec["verdict"], confidence=dec["confidence"], entry=pos["entry"], stop=pos["stop"],
+                target=pos["target"], liquidation=pos["liq"], rr_after_costs=round(pos["rr_after_costs"], 2),
+                liq_before_stop=bool(pos["liq_before_stop"]), max_safe_leverage=pos["max_safe_lev"],
+                reasons=_plain_reasons(dec), blockers=[t for k_, t in _reason_items(dec) if k_ == "bad"],
+                bt_n=int(s["n"]) if s else 0, bt_exp_r=round(float(s["exp_r"]), 3) if s else None,
+                bt_exp_pct=round(float(s["exp_pct"]), 3) if s else None, bt_win_rate=round(float(s["win_rate"]), 1) if s else None)
+
+
+def scan_pair(pair: str, styles: list[str], collateral: float = 100.0, entries: list[dict] | None = None,
+              pause: float = 0.05) -> list[dict]:
+    """Scan one pair for the given styles. Never raises: failures come back as ok=False."""
+    entries = entries or []
+    need: dict[str, int] = {}
+    for s_ in styles:
+        cfg = STYLES[s_]
+        for tf in cfg["tfs"]:
+            need[tf] = max(need.get(tf, 0), LIVE_BARS)
+        need[cfg["primary"]] = max(need[cfg["primary"]], cfg["bt_candles"])
+    data: dict[str, tuple] = {}
+    for tf, n in need.items():
+        df, src = None, None
+        for attempt in range(2):                      # one polite retry
+            try:
+                df, src, _ = load_klines(pair, tf, n, budget_s=35 if n > LIVE_BARS else 15)
+            except Exception:
+                df = None
+            if df is not None:
+                break
+            time.sleep(1.0)
+        data[tf] = (df, src)
+        time.sleep(pause)
+    try:
+        funding = load_funding_rate(pair)
+    except Exception:
+        funding = (DEFAULT_FUNDING_8H, "estimate (0.01% per 8h)", True)
+
+    def fetcher(p, tf, n):                            # same shape as fetch_live()
+        df, src = data.get(tf, (None, None))
+        return (df.tail(n).reset_index(drop=True) if df is not None else None), src, []
+
+    out = []
+    for s_ in styles:
+        cfg, lev = STYLES[s_], default_leverage(s_)
+        base = dict(pair=pair, style=s_, leverage=lev, collateral=collateral)
+        try:
+            mtf = multi_timeframe(pair, s_, cfg["st_period"], cfg["st_mult"], fetcher=fetcher)
+            prim = mtf["tfs"][mtf["primary"]]
+            pos = {d: compute_position(collateral, lev, prim["close"], prim["atr"], d, s_, funding[0])
+                   for d in (1, -1)}
+            bt, bt_note = None, None
+            hist, bt_src = data[cfg["primary"]]
+            if hist is None or len(hist) < 300:
+                bt_note = "not enough history"
+            else:
+                try:
+                    bt = run_backtest(hist.tail(cfg["bt_candles"]).reset_index(drop=True), s_, lev,
+                                      funding[0], cfg["st_period"], cfg["st_mult"])
+                except Exception as e:
+                    bt_note = f"backtest failed ({type(e).__name__})"
+            decs = {}
+            for d in (1, -1):
+                mult, _ = learning_multiplier(entries, s_, pair, d)
+                decs[d] = decide(mtf, s_, lev, pos[d], bt, mult, d)
+            best = pick_side(decs, DIRECTION_MODES[0])
+            last_t = prim["last_time"]
+            base.update(
+                ok=True, score=round(mtf["score"], 1), price=prim["close"],
+                source=", ".join(mtf["sources"]), primary_tf=mtf["primary"],
+                candle_time_utc=last_t.isoformat(),
+                candle_time_local=f"{last_t.tz_convert(LOCAL_TZ):%d %b %H:%M} {LOCAL_TZ_LABEL}",
+                funding_rate=funding[0], funding_estimated=bool(funding[2]), bt_note=bt_note,
+                bt_days=round(bt["days"]) if bt else None, bt_candles=bt["n_candles"] if bt else 0,
+                bt_source=(bt_src or ""),
+                status=decs[best]["verdict"] if decs[best]["verdict"] != "NO-GO" else "NO-GO",
+                best_side=decs[best]["side"], best_confidence=decs[best]["confidence"],
+                long=_side_summary(decs[1], pos[1], bt), short=_side_summary(decs[-1], pos[-1], bt),
+                problems=mtf["problems"],
+            )
+        except Exception as e:
+            base.update(ok=False, error=str(e)[:200])
+        out.append(base)
+    return out
+
+
+def scan_pairs(pairs: list[str], styles: list[str], collateral: float = 100.0,
+               entries: list[dict] | None = None, workers: int = 4, progress=None) -> dict:
+    """Scan many pairs (a few at a time, to be polite to the free APIs)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    t0 = time.time()
+    results, done = [], 0
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futs = {ex.submit(scan_pair, p, styles, collateral, entries): p for p in pairs}
+        for f in as_completed(futs):
+            try:
+                results.extend(f.result())
+            except Exception as e:
+                results.extend(dict(pair=futs[f], style=s_, ok=False, error=str(e)[:200]) for s_ in styles)
+            done += 1
+            if progress:
+                progress(done, len(pairs))
+    order = {p: i for i, p in enumerate(pairs)}
+    results.sort(key=lambda r: (order.get(r["pair"], 999), list(STYLES).index(r["style"])))
+    skipped = sorted({r["pair"] for r in results if not r["ok"]} - {r["pair"] for r in results if r["ok"]},
+                     key=lambda p: order.get(p, 999))
+    return dict(results=results, skipped=skipped, seconds=round(time.time() - t0, 1),
+                errors={r["pair"] + "/" + r["style"]: r.get("error") for r in results if not r["ok"]})
+
+
+
+# =============================================================================
 # 10. USER INTERFACE  (iOS-style, phone-first)
 # =============================================================================
 # The home screen is deliberately simple:
@@ -1534,6 +1689,58 @@ def render_backtest(res, style, leverage):
     html(f'<div class="note">Data: {_html.escape(bt.get("source", ""))}. Past results do not guarantee future results.</div>')
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_scan(style: str, pairs: tuple, collateral: float, log_json: str) -> dict:
+    """Scan results are remembered for 10 minutes."""
+    entries = json.loads(log_json) if log_json else []
+    res = scan_pairs(list(pairs), [style], collateral, entries, workers=4)
+    res["time"] = datetime.now(timezone.utc).isoformat()
+    return res
+
+
+def render_scan(style: str, collateral: float, entries: list[dict]):
+    """Scan tab: check many pairs for the selected style and list the best side of each."""
+    lev = default_leverage(style)
+    all_pairs = st.checkbox(f"Scan all {len(SCAN_PAIRS)} pairs (slower)", key="scan_all")
+    pairs = SCAN_PAIRS if all_pairs else SCAN_PAIRS[:SCAN_PAIRS_CLOUD]
+    html(f'<div class="note">Checks {len(pairs)} pairs for <b>{style}</b> at its suggested {lev}x, long and '
+         'short, with the same rules as the main screen. Results are kept for 10 minutes. '
+         'Phone alerts come from Grok Bot\'s scheduled scan, not from this page.</div>')
+    key = f"scan_{style}_{len(pairs)}"
+    try:
+        clicked = st.button("Scan pairs", type="primary", width="stretch")
+    except TypeError:
+        clicked = st.button("Scan pairs", type="primary", use_container_width=True)
+    if clicked:
+        with st.spinner(f"Scanning {len(pairs)} pairs - about {max(20, len(pairs) * 3)} seconds..."):
+            try:
+                st.session_state[key] = cached_scan(style, tuple(pairs), float(collateral),
+                                                    json.dumps(entries, sort_keys=True))
+            except Exception as e:
+                st.error(f"Scan failed ({type(e).__name__}). Please try again in a minute.")
+    res = st.session_state.get(key)
+    if not res:
+        return
+    ok = [r for r in res["results"] if r.get("ok")]
+    ok.sort(key=lambda r: (r["status"] == "NO-GO", -r["best_confidence"]))
+    n_go = sum(r["status"] != "NO-GO" for r in ok)
+    when = datetime.fromisoformat(res["time"]).astimezone(LOCAL_TZ)
+    html(f'<div class="section">{len(ok)} pairs · {n_go} GO · {when:%H:%M} {LOCAL_TZ_LABEL.split(" (")[0]}</div>')
+    cells = ""
+    for r in ok:
+        go = r["status"] != "NO-GO"
+        side_txt = r["status"] if go else f"{r['best_side'].title()} · no-go"
+        colour = IOS["green"] if go else IOS["muted"]
+        bg = ' style="background:rgba(52,199,89,0.14); margin:0 -14px; padding:10px 14px"' if go else ""
+        cells += (f'<div class="row"{bg}><div class="l">{_html.escape(r["pair"])}'
+                  f'<small>{_html.escape(side_txt)} · score {r["score"]:+.0f}</small></div>'
+                  f'<div class="r" style="color:{colour}">{r["best_confidence"]}%</div></div>')
+    html(f'<div class="rows">{cells}</div>')
+    if res["skipped"]:
+        html(f'<div class="note">Skipped (no data): {_html.escape(", ".join(res["skipped"]))}</div>')
+    html(f'<div class="note">Took {res["seconds"]:.0f}s. Pick a pair in Settings to see its full analysis.</div>')
+
+
 def render_tabs(res, pair, style, collateral, leverage, entries, mode=DIRECTION_MODES[0]):
     """Everything below the home screen, in four simple tabs."""
     decisions = res["decisions"]
@@ -1541,7 +1748,7 @@ def render_tabs(res, pair, style, collateral, leverage, entries, mode=DIRECTION_
     decision = decisions.get(chosen) if decisions else None
     pos = (res["pos"] or {}).get(chosen)
     mtf = res["mtf"]
-    t_chart, t_details, t_bt, t_journal = st.tabs(["Chart", "Details", "Backtest", "Journal"])
+    t_chart, t_details, t_bt, t_journal, t_scan = st.tabs(["Chart", "Details", "Backtest", "Journal", "Scan"])
     with t_chart:
         if mtf:
             leg = [("Supertrend", IOS["green"]), ("EMA 9", IOS["yellow"]), ("21", IOS["teal"]),
@@ -1561,6 +1768,8 @@ def render_tabs(res, pair, style, collateral, leverage, entries, mode=DIRECTION_
         render_backtest(res, style, leverage)
     with t_journal:
         render_journal(entries, pair, style, decision)
+    with t_scan:
+        render_scan(style, collateral, entries)
 
 
 def main():
