@@ -85,7 +85,7 @@ Don't upload the `screenshot_*.png` files. They're only preview pictures.
 | "Could not load ... for XYZUSDT" | Check the pair name. Use the coin + USDT, e.g. `SOLUSDT`, `PEPEUSDT`. Very new or tiny coins may not be on the free data sources. |
 | `ModuleNotFoundError` on the deploy screen | Make sure `requirements.txt` is uploaded, sits next to `app.py` (not in a sub-folder) and is spelt exactly like that. Then use **Manage app → Reboot app**. |
 | App shows an error after you edited it | Undo your change on GitHub (open the file → History) or upload the original `app.py` again. |
-| Backtest is slow the first time | It downloads up to a year of prices. Results are remembered for 30 minutes, so later runs are quick. |
+| First load is slow | It downloads up to a year of prices (a few seconds). The history is kept for an hour and only the newest candles are added after that, so later taps are quick. If the app was asleep, Streamlit needs 30-60 seconds to wake it up first. |
 | Can't find the app link again | Go to share.streamlit.io → **My apps**. |
 
 ---

@@ -35,7 +35,9 @@ import io
 import json
 import math
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -104,8 +106,19 @@ STYLES = {
     ),
 }
 
-HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "crypto-trade-screener/1.0", "Accept": "application/json"})
+HISTORY_TTL = 3600             # long backtest history is downloaded at most once an hour ...
+LIVE_TTL = 60                  # ... and topped up with the fresh live candles (cached 60 seconds)
+PAGE_WORKERS = 6               # history pages downloaded at the same time
+
+
+@st.cache_resource(show_spinner=False)
+def http_session() -> requests.Session:
+    """One shared keep-alive connection pool (survives reruns, so no new TLS handshakes)."""
+    s = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=32)
+    s.mount("https://", adapter)
+    s.headers.update({"User-Agent": "crypto-trade-screener/1.0", "Accept": "application/json"})
+    return s
 
 
 class DataError(Exception):
@@ -131,7 +144,7 @@ def parse_pair(raw: str) -> tuple[str, str]:
 
 
 def _get_json(url: str, params: dict | None = None):
-    r = HTTP.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    r = http_session().get(url, params=params, timeout=REQUEST_TIMEOUT)
     if r.status_code == 451:
         raise DataError("blocked in this region (HTTP 451)")
     if r.status_code == 403:
@@ -241,10 +254,11 @@ def _coinbase_symbols(base, quote):
 # Order matters: first one that works is used.
 SOURCES = [
     dict(name="Binance (public data mirror)", fetch=_binance_fetch("https://data-api.binance.vision"),
-         page=1000, paginate=True, ivs=set(INTERVAL_SECONDS), syms=lambda b, q: [f"{b}{q}"]),
+         page=1000, paginate=True, parallel=True, ivs=set(INTERVAL_SECONDS),
+         syms=lambda b, q: [f"{b}{q}"]),
     dict(name="Binance", fetch=_binance_fetch("https://api.binance.com"),
-         page=1000, paginate=True, ivs=set(INTERVAL_SECONDS), syms=lambda b, q: [f"{b}{q}"]),
-    dict(name="Bybit", fetch=_bybit_fetch, page=1000, paginate=True,
+         page=1000, paginate=True, parallel=True, ivs=set(INTERVAL_SECONDS), syms=lambda b, q: [f"{b}{q}"]),
+    dict(name="Bybit", fetch=_bybit_fetch, page=1000, paginate=True, parallel=True,
          ivs=set(INTERVAL_SECONDS), syms=lambda b, q: [f"{b}{q}"]),
     dict(name="OKX", fetch=_okx_fetch, page=100, paginate=True,
          ivs=set(INTERVAL_SECONDS), syms=lambda b, q: [f"{b}-{q}"]),
@@ -270,6 +284,40 @@ def _resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return out.dropna().reset_index()
 
 
+def _parallel_pages(src, sym, iv, need, oldest) -> list:
+    """Fetch the next pages at the same time instead of one after another.
+
+    These sources return the `page` candles that end at `endTime`. Window k ends
+    k*page candles before the oldest one we have. Without gaps in the data the windows
+    line up exactly with what step-by-step paging would ask for; with gaps they
+    overlap (never leave holes), so after removing duplicates and keeping the last n
+    candles the result is identical. A failed/empty window stops the chain there,
+    just like the step-by-step loop would."""
+    step_ms = INTERVAL_SECONDS[iv] * 1000
+    page = src["page"]
+    k_pages = math.ceil(need / page)
+    base = int(oldest.timestamp() * 1000) - 1
+    ends = [base - k * page * step_ms for k in range(k_pages)]
+
+    def one(end_ms):
+        try:
+            return src["fetch"](sym, iv, page, end_ms)
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=min(PAGE_WORKERS, k_pages)) as ex:
+        pages = list(ex.map(one, ends))
+    out, cur_oldest = [], oldest
+    for pg in pages:
+        if pg is None:
+            break
+        pg = pg[pg["time"] < cur_oldest]
+        if pg.empty:
+            break
+        out.append(pg)
+        cur_oldest = pg["time"].iloc[0]
+    return out
+
+
 def _paginate(src, sym, iv, n, budget_s) -> pd.DataFrame:
     """Download up to n candles from one source, walking backwards in time."""
     t0 = time.time()
@@ -277,6 +325,12 @@ def _paginate(src, sym, iv, n, budget_s) -> pd.DataFrame:
     if first.empty:
         raise DataError("no candles returned")
     frames, total = [first], len(first)
+    if total < n and src["paginate"] and src.get("parallel") and len(first) >= src["page"]:
+        more = _parallel_pages(src, sym, iv, n - total, first["time"].iloc[0])
+        frames += more
+        total += sum(len(p) for p in more)
+        if more and len(more[-1]) < src["page"]:     # reached the start of this coin's history
+            n = min(n, total)
     while total < n and src["paginate"] and time.time() - t0 < budget_s:
         oldest = frames[-1]["time"].iloc[0]
         try:
@@ -334,16 +388,40 @@ def load_klines(pair: str, interval: str, n: int, budget_s: float = 20.0):
     return None, None, errors
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=LIVE_TTL, max_entries=64, show_spinner=False)
 def fetch_live(pair: str, interval: str, n: int = LIVE_BARS):
     """Recent candles for the live analysis/chart (cached 60 seconds)."""
     return load_klines(pair, interval, n, budget_s=15)
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_history(pair: str, interval: str, n: int):
-    """Long history for the backtest (cached 30 minutes)."""
+@st.cache_data(ttl=HISTORY_TTL, max_entries=16, show_spinner=False)
+def _fetch_history_base(pair: str, interval: str, n: int):
+    """The long download (cached 1 hour)."""
     return load_klines(pair, interval, n, budget_s=35)
+
+
+def merge_latest(hist, live, n: int):
+    """Top up cached history with the latest live candles (same source only).
+
+    Closed candles never change, so the result equals a fresh download of the
+    latest n candles - without downloading 12 months again."""
+    h_df, h_src = hist[0], hist[1]
+    if h_df is None or live is None or live[0] is None or live[1] != h_src or live[0].empty:
+        return hist
+    l_df = live[0]
+    if l_df["time"].iloc[0] > h_df["time"].iloc[-1]:      # no overlap: keep the cached copy
+        return hist
+    merged = (pd.concat([h_df, l_df]).drop_duplicates("time", keep="last")
+              .sort_values("time").tail(n).reset_index(drop=True))
+    return merged, h_src, hist[2]
+
+
+def fetch_history(pair: str, interval: str, n: int, live=None):
+    """Long history for the backtest: cached for an hour, refreshed with live candles."""
+    hist = _fetch_history_base(pair, interval, n)
+    if live is None:
+        live = fetch_live(pair, interval, LIVE_BARS)
+    return merge_latest(hist, live, n)
 
 
 def load_funding_rate(pair: str):
@@ -367,7 +445,7 @@ def load_funding_rate(pair: str):
     return DEFAULT_FUNDING_8H, "estimate (0.01% per 8h)", True
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, max_entries=32, show_spinner=False)
 def fetch_funding(pair: str):
     return load_funding_rate(pair)
 
@@ -1024,6 +1102,12 @@ def price_chart(d: pd.DataFrame, pair: str, tf: str, pos: dict | None = None) ->
     return fig
 
 
+@st.cache_data(ttl=2 * LIVE_TTL, max_entries=16, show_spinner=False)
+def cached_price_chart(d: pd.DataFrame, pair: str, tf: str, pos: dict | None = None) -> go.Figure:
+    """Same chart, built once per data/side instead of on every tap."""
+    return price_chart(d, pair, tf, pos)
+
+
 def equity_chart(bt: dict) -> go.Figure:
     e = bt["equity"]
     up = e["equity"].iloc[-1] >= 100
@@ -1379,34 +1463,91 @@ def verdict_colour(dec: dict) -> str:
     return IOS["green"] if dec["verdict"].startswith("GO") else IOS["red"]
 
 
-def run_analysis(pair, style, collateral, leverage, st_period, st_mult, entries):
-    """Do all the work for BOTH sides. Returns a dict with everything the tabs need."""
+def history_label(style: str) -> str:
+    cfg = STYLES[style]
+    days = cfg["bt_candles"] * INTERVAL_SECONDS[cfg["primary"]] / 86400
+    return "12 months" if days >= 330 else f"{days / 7:.0f} weeks"
+
+
+def prefetch(pair: str, style: str) -> None:
+    """Download every timeframe, the history and the funding rate at the same time.
+
+    The results land in the normal caches, so the analysis below just reads them."""
+    cfg = STYLES[style]
+    jobs = [(fetch_live, (pair, tf, LIVE_BARS)) for tf in cfg["tfs"]]
+    jobs += [(_fetch_history_base, (pair, cfg["primary"], cfg["bt_candles"])), (fetch_funding, (pair,))]
+    try:
+        from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+        ctx = get_script_run_ctx()
+    except Exception:
+        ctx = None
+
+    def run(job):
+        if ctx is not None:
+            add_script_run_ctx(threading.current_thread(), ctx)
+        try:
+            job[0](*job[1])
+        except Exception:
+            pass            # the normal (sequential) path below reports the problem
+    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        list(ex.map(run, jobs))
+
+
+def _data_stamp(pair: str, style: str) -> tuple:
+    """Fingerprint of the current live data (changes when a new price arrives)."""
+    stamp = []
+    for tf in STYLES[style]["tfs"]:
+        df, src, _ = fetch_live(pair, tf, LIVE_BARS)
+        if df is not None and len(df):
+            last = df.iloc[-1]
+            stamp.append((tf, src, len(df), str(last["time"]), float(last["close"]),
+                          float(last["high"]), float(last["low"]), float(last["volume"])))
+        else:
+            stamp.append((tf, None))
+    stamp.append(tuple(fetch_funding(pair)))
+    return tuple(stamp)
+
+
+@st.cache_data(ttl=2 * LIVE_TTL, max_entries=24, show_spinner=False)
+def _analysis(pair, style, collateral, leverage, st_period, st_mult, log_json, stamp):
+    """Indicators, position, backtest and decisions for BOTH sides.
+
+    Cached on the settings + data fingerprint: switching direction, tabs or
+    expanders reuses the result instead of recomputing it."""
+    entries = json.loads(log_json) if log_json else []
     cfg = STYLES[style]
     out = dict(mtf=None, bt=None, pos={}, decisions={}, bt_note=None,
                funding=(DEFAULT_FUNDING_8H, "estimate (0.01% per 8h)", True))
-    with st.spinner("Downloading prices and analysing..."):
-        mtf = multi_timeframe(pair, style, st_period, st_mult)
-        out["funding"] = fetch_funding(pair)
-        prim = mtf["tfs"][mtf["primary"]]
-        out["mtf"] = mtf
-        # Long and short have different stops, targets and liquidation prices.
-        out["pos"] = {d: compute_position(collateral, leverage, prim["close"], prim["atr"], d,
-                                          style, out["funding"][0]) for d in (1, -1)}
-    with st.spinner("Running the 12-month backtest (the first run can take ~30 seconds)..."):
-        try:
-            hist, hist_src, _ = fetch_history(pair, cfg["primary"], cfg["bt_candles"])
-            if hist is None or len(hist) < 300:
-                out["bt_note"] = "Not enough price history to run a backtest for this pair."
-            else:
-                bt = run_backtest(hist, style, leverage, out["funding"][0], st_period, st_mult)
-                bt["source"] = hist_src
-                out["bt"] = bt
-        except Exception as e:  # a backtest problem shouldn't stop everything else
-            out["bt_note"] = f"Backtest could not run ({type(e).__name__})."
+    mtf = multi_timeframe(pair, style, st_period, st_mult)
+    out["funding"] = fetch_funding(pair)
+    prim = mtf["tfs"][mtf["primary"]]
+    out["mtf"] = mtf
+    # Long and short have different stops, targets and liquidation prices.
+    out["pos"] = {d: compute_position(collateral, leverage, prim["close"], prim["atr"], d,
+                                      style, out["funding"][0]) for d in (1, -1)}
+    try:
+        hist, hist_src, _ = fetch_history(pair, cfg["primary"], cfg["bt_candles"])
+        if hist is None or len(hist) < 300:
+            out["bt_note"] = "Not enough price history to run a backtest for this pair."
+        else:
+            bt = run_backtest(hist, style, leverage, out["funding"][0], st_period, st_mult)
+            bt["source"] = hist_src
+            out["bt"] = bt
+    except Exception as e:  # a backtest problem shouldn't stop everything else
+        out["bt_note"] = f"Backtest could not run ({type(e).__name__})."
     for d in (1, -1):
         mult, _ = learning_multiplier(entries, style, pair, d)
         out["decisions"][d] = decide(mtf, style, leverage, out["pos"][d], out["bt"], mult, d)
     return out
+
+
+def run_analysis(pair, style, collateral, leverage, st_period, st_mult, entries):
+    """Do all the work for BOTH sides. Returns a dict with everything the tabs need."""
+    with st.spinner(f"Loading live prices and {history_label(style)} of history..."):
+        prefetch(pair, style)
+        stamp = _data_stamp(pair, style)
+        return _analysis(pair, style, float(collateral), leverage, st_period, st_mult,
+                         json.dumps(entries, sort_keys=True, default=str), stamp)
 
 
 def settings_card():
@@ -1749,28 +1890,41 @@ def render_tabs(res, pair, style, collateral, leverage, entries, mode=DIRECTION_
     decision = decisions.get(chosen) if decisions else None
     pos = (res["pos"] or {}).get(chosen)
     mtf = res["mtf"]
-    t_chart, t_details, t_bt, t_journal, t_scan = st.tabs(["Chart", "Details", "Backtest", "Journal", "Scan"])
-    with t_chart:
-        if mtf:
-            leg = [("Supertrend", IOS["green"]), ("EMA 9", IOS["yellow"]), ("21", IOS["teal"]),
-                   ("50", IOS["purple"]), ("200", IOS["orange"])]
-            html('<div class="legend">' + "".join(f'<span><b style="background:{c}"></b>{n}</span>' for n, c in leg)
-                 + "</div>")
-            show_fig(price_chart(mtf["tfs"][mtf["primary"]]["data"], pair, mtf["primary"], pos))
-            side_txt = decision["side"].lower() if decision else "long"
-            html(f'<div class="note">{pair} · {mtf["primary"]} candles · {LOCAL_TZ_LABEL}. Supertrend turns red in a '
-                 f'down-trend. Dashed lines: entry, stop and target for the {side_txt} side. Below: volume, then '
-                 'RSI (over 70 stretched up, under 30 stretched down). Pinch to zoom.</div>')
-        else:
-            html('<div class="note">No chart - see the message above.</div>')
-    with t_details:
-        render_details(res, style, leverage, chosen)
-    with t_bt:
-        render_backtest(res, style, leverage)
-    with t_journal:
-        render_journal(entries, pair, style, decision)
-    with t_scan:
-        render_scan(style, collateral, entries, leverage)
+    names = ["Chart", "Details", "Backtest", "Journal", "Scan"]
+    try:    # newer Streamlit: only the open tab's content is built and sent to the phone
+        t_chart, t_details, t_bt, t_journal, t_scan = st.tabs(names, key="main_tab", on_change="rerun")
+    except TypeError:
+        t_chart, t_details, t_bt, t_journal, t_scan = st.tabs(names)
+
+    def is_open(t):          # None = older Streamlit without lazy tabs -> draw everything
+        return getattr(t, "open", None) is not False
+
+    if is_open(t_chart):
+        with t_chart:
+            if mtf:
+                leg = [("Supertrend", IOS["green"]), ("EMA 9", IOS["yellow"]), ("21", IOS["teal"]),
+                       ("50", IOS["purple"]), ("200", IOS["orange"])]
+                html('<div class="legend">' + "".join(f'<span><b style="background:{c}"></b>{n}</span>' for n, c in leg)
+                     + "</div>")
+                show_fig(cached_price_chart(mtf["tfs"][mtf["primary"]]["data"], pair, mtf["primary"], pos))
+                side_txt = decision["side"].lower() if decision else "long"
+                html(f'<div class="note">{pair} · {mtf["primary"]} candles · {LOCAL_TZ_LABEL}. Supertrend turns red in a '
+                     f'down-trend. Dashed lines: entry, stop and target for the {side_txt} side. Below: volume, then '
+                     'RSI (over 70 stretched up, under 30 stretched down). Pinch to zoom.</div>')
+            else:
+                html('<div class="note">No chart - see the message above.</div>')
+    if is_open(t_details):
+        with t_details:
+            render_details(res, style, leverage, chosen)
+    if is_open(t_bt):
+        with t_bt:
+            render_backtest(res, style, leverage)
+    if is_open(t_journal):
+        with t_journal:
+            render_journal(entries, pair, style, decision)
+    if is_open(t_scan):
+        with t_scan:
+            render_scan(style, collateral, entries, leverage)
 
 
 def main():
