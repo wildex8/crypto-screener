@@ -54,9 +54,9 @@ from plotly.subplots import make_subplots
 APP_DIR = Path(__file__).resolve().parent
 LEARNING_LOG_PATH = APP_DIR / "learning_log.json"
 
-# Sri Lanka time (UTC+5:30, no daylight saving) - used for all displayed times.
-LOCAL_TZ = timezone(timedelta(hours=5, minutes=30))
-LOCAL_TZ_LABEL = "Sri Lanka time (UTC+5:30)"
+# UAE time (Gulf Standard Time, UTC+4, no daylight saving) - used for all displayed times.
+LOCAL_TZ = timezone(timedelta(hours=4))
+LOCAL_TZ_LABEL = "UAE time (UTC+4)"
 
 TAKER_FEE = 0.0004             # 0.04 % taker fee, charged on entry AND on exit
 MAINT_MARGIN_RATE = 0.005      # 0.5 % maintenance margin used for the liquidation estimate
@@ -1419,7 +1419,7 @@ def render_home(res, mode):
              f'Use {pos["max_safe_lev"]}x or less.</div>')
     last_t = mtf["tfs"][mtf["primary"]]["last_time"].tz_convert(LOCAL_TZ)
     src = ", ".join(sorted({re.sub(r"\s*\([A-Z0-9-]+\)$", "", x) for x in mtf["sources"]}))
-    html(f'<div class="note">{_html.escape(src)} · {mtf["primary"]} · updated {last_t:%H:%M} Sri Lanka time. '
+    html(f'<div class="note">{_html.escape(src)} · {mtf["primary"]} · updated {last_t:%H:%M} UAE time. '
          'The latest candle is still forming, so this can change.</div>')
     return chosen
 

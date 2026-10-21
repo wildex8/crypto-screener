@@ -159,7 +159,7 @@ A side can only be GO if all of these are true:
 
 Below that are four tabs:
 
-- **Chart**: candles with the **Supertrend** line (green = up-trend, red = down-trend) and the EMA lines, plus dashed lines for entry, stop and target. Volume is in the middle and **RSI** at the bottom (above 70 = stretched up, below 30 = stretched down). Pinch to zoom. Times are Sri Lanka time.
+- **Chart**: candles with the **Supertrend** line (green = up-trend, red = down-trend) and the EMA lines, plus dashed lines for entry, stop and target. Volume is in the middle and **RSI** at the bottom (above 70 = stretched up, below 30 = stretched down). Pinch to zoom. Times are UAE time (UTC+4).
 - **Details**:
   - your position size, the max safe leverage, what you'd lose at the stop and gain at the target
   - distances to the stop and to liquidation
