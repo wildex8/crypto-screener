@@ -236,6 +236,17 @@ Switched on per ledger with `python paper_trader.py --enable-protection [--daily
 - Open trades are never force-closed by these rules. Skipped signals appear under `paper.not_opened` with the reason; status is in `paper.protection` (`just_triggered` lists a limit the first time it is hit).
 - **Let winners run:** at +1R the stop moves to break-even plus costs. At the original target half is closed and booked, and the rest is trailed with an ATR(14) x Supertrend-multiplier stop on the trade's own timeframe (only ever tightens; may run up to 2x the normal max hold). A trade is still one result: its P&L and R include the booked half, R on the full position.
 
+### Trading sessions and the high-confidence exception
+
+Switched on per ledger with `python paper_trader.py --enable-sessions [--override-min-confidence 75]` (stored under `rules.sessions` and `rules.high_conf_override`). These only decide whether a practice trade opens; signals and alerts are computed as before. Times are UAE; the NY open is 09:30 New York time converted each day, so US daylight saving is automatic.
+
+- **Prime** (Mon-Fri, NY open -75 min to +3h: 16:15-20:30 UAE in US summer time, 17:15-21:30 in winter): 55% on every style. A 15m/30m signal from the candle that opens at the NY open is skipped; the next bar can enter.
+- **Normal** (other weekday hours, 08:00-21:00): 55%, but 15m scalps need 65% during 08:00-11:00 and 13:00 until prime.
+- **Quiet** (weekends, weekday 21:00 or prime end until 08:00): 70% and the style's highest chart Supertrend agrees (`higher_tf_agrees`: 4h for Day/15m/30m scalps, 1d for 1h scalps, 1w for Swing). At most 2 open trades opened in quiet hours.
+- Outside prime, new trades only while fewer than 4 are open (2 of the 6 slots kept for prime).
+- Every trade is tagged `session` (prime, normal or quiet).
+- **High-confidence exception** (75%+): may open despite the profit lock, the 6-trade cap or the prime slots at full size; despite the daily loss limit once per UAE day at half size ($500 collateral); never despite the weekly limit or the quiet-hours cap. Session rules, the NY-open-candle skip and free cash still apply. Tagged `override.kind = "high_confidence"`.
+
 The ledger lives in `/workspace/scanner/paper/` on Grok Bot's computer (`trades.json`, `learning.json`, with backups before every write).
 
 ---

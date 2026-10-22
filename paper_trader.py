@@ -65,6 +65,25 @@ ACCOUNT PROTECTION + LET WINNERS RUN (trades.json "rules" section; switched on w
   - One trade = one result: pnl_usd / r_multiple of a closed trade include the booked
     half (R on the full position's initial risk); partials[] lists the half closes.
 
+SESSIONS + HIGH-CONFIDENCE (75%+) EXCEPTION (trades.json rules.sessions / rules.high_conf_override; switched on
+with --enable-sessions). They only decide whether a PRACTICE TRADE opens; signals are unchanged.
+  NY open = 09:30 America/New_York converted to UAE each day (US DST handled by zoneinfo).
+  - prime  (Mon-Fri UAE date, NY open -75 min to +3h; 16:15-20:30 UAE in US summer time,
+            17:15-21:30 in winter): 55% on every style. A 15m/30m signal whose candle opens at
+            the NY open is skipped ("NY open candle, wait for next bar").
+  - normal (other weekday hours 08:00 -> 21:00 UAE): 55%, but 15m scalps need 65% during
+            08:00-11:00 and 13:00 -> prime start.
+  - quiet  (weekends, weekday 21:00 (or prime end if later) -> 08:00): 70% AND the higher
+            chart agrees (features.higher_tf_agrees = the Supertrend direction on the style's
+            highest timeframe: 4h for Day / Scalp-15m / Scalp-30m, 1d for Scalp-1h, 1w for Swing).
+            At most 2 open trades that were opened in quiet hours.
+  - outside prime, new trades only while fewer than 4 are open (2 of the 6 slots kept for prime).
+  Every new trade is tagged session = prime | normal | quiet.
+  High-confidence exception (confidence >= 75, rules.high_conf_override.override_min_confidence): may open despite the profit lock, the 6-trade cap or the
+  slots kept for prime at full size; despite the daily loss limit once per UAE day at half size
+  ($500 collateral); never despite the weekly limit or the quiet-hours cap. Session rules, the
+  NY-open-candle skip and the free-cash check still apply. Tagged override = {...}.
+
 Usage:
   python paper_trader.py --run [--scan last_run.json] [--ledger DIR]     (used by run.sh)
   python paper_trader.py --summary [--ledger DIR]
@@ -84,7 +103,8 @@ import shutil
 import sys
 import time
 import warnings
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -125,6 +145,17 @@ BLOCK_MAX_WR = 30.0
 DEFAULT_PROTECTION = dict(daily_loss_pct=3.0, daily_goal_usd=500.0, giveback_frac=0.5,
                           weekly_loss_pct=8.0, max_open=6)
 DEFAULT_RUNNERS = dict(breakeven_at_r=1.0, partial_frac=0.5, atr_period=14, runner_hold_mult=2.0)
+
+DEFAULT_SESSIONS = dict(
+    ny_tz="America/New_York", ny_open="09:30", prime_before_min=75, prime_after_min=180,
+    day_start="08:00", normal_end="21:00",
+    prime_conf=55, normal_conf=55, scalp15_strict_conf=65,
+    scalp15_strict_windows=[["08:00", "11:00"], ["13:00", "prime"]],
+    quiet_conf=70, quiet_need_higher_tf=True, quiet_max_open=2,
+    prime_reserved_slots=2, ny_candle_skip_tfs=["15m", "30m"])
+DEFAULT_OVERRIDE = dict(override_min_confidence=75, full_size=["profit_lock", "max_open", "prime_reserved"],
+                        half_size=["daily_loss"], half_size_per_day=1, half_size_frac=0.5)
+PAUSE_ORDER = ["weekly", "daily_loss", "profit_lock", "max_open", "prime_reserved", "quiet_cap"]
 
 REASON_TEXT = {
     "stop": "hit its stop", "liq": "was liquidated", "target": "hit its target",
@@ -754,7 +785,7 @@ def lessons(learning: dict, trades_doc: dict) -> list[str]:
 # ---------------------------------------------------------------- open / close
 
 def open_trade(sig: dict, now: datetime, features: dict, tags: list[str], note: str = "", probe=False,
-               funding=None, required=None) -> dict:
+               funding=None, required=None, collateral: float = COLLATERAL) -> dict:
     style = sig["style"]
     cfg = style_cfg(style)
     d = 1 if sig["side"] == "LONG" else -1
@@ -768,14 +799,15 @@ def open_trade(sig: dict, now: datetime, features: dict, tags: list[str], note: 
     liq = app.liquidation_price(entry_fill, LEVERAGE, d)
     mh = max_hold_hours(style)
     tid = f"{sig['pair']}-{style}-{sig['side']}-{now:%Y%m%d%H%M%S}"
+    notional = float(collateral) * LEVERAGE
     features = dict(features, funding_rate_8h=fr[0])
     return dict(
         id=tid, status="open", pair=sig["pair"], style=style, side=sig["side"], dir=d,
         entry_tf=cfg["primary"], confidence=sig.get("confidence"), required_confidence=required,
         opened_at=now.isoformat(), signal_time=sig.get("signal_time") or now.isoformat(),
         entry=entry, entry_fill=entry_fill, stop=stop, target=target, liquidation=liq,
-        notional=NOTIONAL, leverage=LEVERAGE, collateral=COLLATERAL, qty=NOTIONAL / entry_fill,
-        planned_risk_usd=NOTIONAL * abs(entry_fill - stop) / entry_fill,
+        notional=notional, leverage=LEVERAGE, collateral=float(collateral), qty=notional / entry_fill,
+        planned_risk_usd=notional * abs(entry_fill - stop) / entry_fill,
         slippage=slip, funding_rate_8h=float(fr[0]), funding_source=fr[1],
         max_hold_hours=mh, deadline=(now + timedelta(hours=mh)).isoformat(),
         last_checked=None, last_price=None, features=features, entry_tags=tags,
@@ -791,6 +823,7 @@ def closed_view(t):
                 r_multiple=r2(t["r_multiple"]), held=dur(t["held_hours"]), held_hours=r2(t["held_hours"]),
                 opened_uae=uae(t["opened_at"]), closed_uae=uae(t["exit_time"]),
                 loss_tags=t.get("loss_tags", []), probe=t.get("probe", False),
+                session=t.get("session"), override=t.get("override"), collateral=t.get("collateral"),
                 reason_text=REASON_TEXT.get(t["reason"], t["reason"]),
                 half_closed_at_target=bool(t.get("partials")),
                 booked_at_target_usd=r2(booked_partial_usd(t)) if t.get("partials") else None,
@@ -803,7 +836,10 @@ def opened_view(t):
                 confidence=t["confidence"], entry=t["entry"], entry_fill=r2(t["entry_fill"], 8), stop=t["stop"],
                 target=t["target"], liquidation=r2(t["liquidation"], 8), notional=t["notional"],
                 collateral=t["collateral"], leverage=t["leverage"], opened_uae=uae(t["opened_at"]),
-                closes_by_uae=uae(t["deadline"]), entry_tags=t["entry_tags"], probe=t["probe"], note=t["note"])
+                closes_by_uae=uae(t["deadline"]), entry_tags=t["entry_tags"], probe=t["probe"], note=t["note"],
+                session=t.get("session"), override=t.get("override"),
+                override_note=(t.get("override") or {}).get("note"),
+                size="half" if t["collateral"] < COLLATERAL - 1e-9 else "full")
 
 
 def open_view(t, now):
@@ -992,9 +1028,264 @@ def enable_protection(ledger: "Ledger", daily_goal: float | None = None, now=Non
     return trades_doc["rules"]
 
 
-def has_free_cash(trades_doc, now) -> bool:
+def has_free_cash(trades_doc, now, need: float = COLLATERAL) -> bool:
     a = account_state(trades_doc, now)
-    return a is None or a["free_cash_usd"] >= COLLATERAL - 1e-9
+    return a is None or a["free_cash_usd"] >= need - 1e-9
+
+
+# ---------------------------------------------------------------- sessions (UAE time, NY open from New York time)
+
+def _hm(x: str):
+    h, m = x.split(":")
+    return int(h), int(m)
+
+
+def _at(day: date, hm: str) -> datetime:
+    h, m = _hm(hm)
+    return datetime(day.year, day.month, day.day, h, m, tzinfo=app.LOCAL_TZ)
+
+
+def ny_open_utc(day: date, cfg: dict) -> datetime:
+    """09:30 New York time on that date (US DST from zoneinfo), as UTC. Same calendar date in UAE."""
+    h, m = _hm(cfg["ny_open"])
+    return datetime(day.year, day.month, day.day, h, m, tzinfo=ZoneInfo(cfg["ny_tz"])).astimezone(timezone.utc)
+
+
+def prime_window(day: date, cfg: dict):
+    nyo = ny_open_utc(day, cfg)
+    return nyo - timedelta(minutes=cfg["prime_before_min"]), nyo + timedelta(minutes=cfg["prime_after_min"]), nyo
+
+
+def get_session_cfg(trades_doc) -> dict | None:
+    c = get_rules(trades_doc).get("sessions")
+    return dict(DEFAULT_SESSIONS, **c) if c else None
+
+
+def get_override_cfg(trades_doc) -> dict | None:
+    c = get_rules(trades_doc).get("high_conf_override")
+    return dict(DEFAULT_OVERRIDE, **c) if c else None
+
+
+def session_at(now: datetime, cfg: dict) -> dict:
+    """Session name at `now` and the windows of that UAE day."""
+    day = now.astimezone(app.LOCAL_TZ).date()
+    weekday = day.weekday() < 5
+    ps, pe, nyo = prime_window(day, cfg)
+    ds = _at(day, cfg["day_start"])
+    ne = max(_at(day, cfg["normal_end"]), pe)
+    if weekday and ps <= now < pe:
+        name = "prime"
+    elif weekday and ds <= now < ne:
+        name = "normal"
+    else:
+        name = "quiet"
+    return dict(name=name, day=day, weekday=weekday, prime_start=ps, prime_end=pe, ny_open=nyo,
+                day_start=ds, normal_end=ne)
+
+
+def next_prime(now: datetime, cfg: dict):
+    day = now.astimezone(app.LOCAL_TZ).date()
+    for i in range(8):
+        d = day + timedelta(days=i)
+        if d.weekday() >= 5:
+            continue
+        ps, pe, nyo = prime_window(d, cfg)
+        if pe > now:
+            return ps, pe, nyo
+    return None
+
+
+def session_min_conf(style: str, sess: dict, now: datetime, cfg: dict):
+    """(minimum confidence, needs higher-timeframe agreement, label) for this style now."""
+    if sess["name"] == "prime":
+        return cfg["prime_conf"], False, "NY prime"
+    if sess["name"] == "quiet":
+        return cfg["quiet_conf"], bool(cfg["quiet_need_higher_tf"]), "quiet hours"
+    if style_cfg(style)["primary"] == "15m":
+        for a, b in cfg["scalp15_strict_windows"]:
+            t0 = _at(sess["day"], a)
+            t1 = sess["prime_start"] if b == "prime" else _at(sess["day"], b)
+            if t0 <= now < t1:
+                return cfg["scalp15_strict_conf"], False, "15m scalps in slow hours"
+    return cfg["normal_conf"], False, "normal hours"
+
+
+def is_ny_open_candle(sig: dict, now: datetime, cfg: dict) -> bool:
+    tf = style_cfg(sig["style"])["primary"]
+    if tf not in cfg["ny_candle_skip_tfs"]:
+        return False
+    ct = sig.get("candle_time_utc")
+    if ct:
+        c = parse_t(ct)
+        return c == ny_open_utc(c.astimezone(app.LOCAL_TZ).date(), cfg)
+    nyo = ny_open_utc(now.astimezone(app.LOCAL_TZ).date(), cfg)       # no candle time: by the clock
+    return nyo <= now < nyo + timedelta(seconds=app.INTERVAL_SECONDS[tf])
+
+
+def session_state(trades_doc, now) -> dict | None:
+    """paper.session: current session, thresholds in force, next prime window (UAE time)."""
+    cfg = get_session_cfg(trades_doc)
+    if not cfg:
+        return None
+    sess = session_at(now, cfg)
+    opens = [t for t in trades_doc["trades"] if t["status"] == "open"]
+    prot_cfg = dict(DEFAULT_PROTECTION, **(get_rules(trades_doc).get("protection") or {}))
+    cap = int(prot_cfg["max_open"])
+    th = {}
+    for st in app.STYLES:
+        if st == "Scalp":
+            continue
+        c, htf, lab = session_min_conf(st, sess, now, cfg)
+        th[st] = dict(min_confidence=c, needs_higher_tf_agreement=htf, rule=lab)
+    np_ = next_prime(now, cfg)
+    hm = lambda x: f"{x.astimezone(app.LOCAL_TZ):%H:%M}"
+    out = dict(
+        name=sess["name"], now_uae=uae(now), day_uae=f"{sess['day']:%a %d %b %Y}",
+        thresholds=th,
+        open_trade_limit=(cap if sess["name"] == "prime" else cap - int(cfg["prime_reserved_slots"])),
+        open_trades=len(opens),
+        quiet_opened_open_trades=sum(t.get("session") == "quiet" for t in opens),
+        quiet_max_open=int(cfg["quiet_max_open"]),
+        ny_open_uae=uae(sess["ny_open"]) if sess["weekday"] else None,
+        prime_today_uae=f"{hm(sess['prime_start'])}-{hm(sess['prime_end'])}" if sess["weekday"] else None,
+        ny_open_candle_skip_uae=(f"{hm(sess['ny_open'])}-{hm(sess['ny_open'] + timedelta(minutes=15))} (15m), "
+                                 f"{hm(sess['ny_open'])}-{hm(sess['ny_open'] + timedelta(minutes=30))} (30m)")
+                                if sess["weekday"] else None,
+        next_prime_uae=(dict(start=uae(np_[0]), end=uae(np_[1]), ny_open=uae(np_[2]),
+                             text=f"{np_[0].astimezone(app.LOCAL_TZ):%a %d %b} {hm(np_[0])}-{hm(np_[1])} UAE")
+                        if np_ else None),
+        in_prime_now=sess["name"] == "prime",
+        higher_tf_field="features.higher_tf_agrees (Supertrend direction on the style's highest chart: "
+                        "4h for Day/Scalp-15m/Scalp-30m, 1d for Scalp-1h, 1w for Swing)")
+    oc = get_override_cfg(trades_doc)
+    if oc:
+        day0 = now.astimezone(app.LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        used = _half_overrides_today(trades_doc, day0)
+        out["high_conf_override"] = dict(min_confidence=oc["override_min_confidence"], full_size_despite=oc["full_size"],
+                                         half_size_despite=oc["half_size"],
+                                         half_size_left_today=max(int(oc["half_size_per_day"]) - used, 0),
+                                         never_despite=["weekly", "quiet_cap"])
+    return out
+
+
+def _half_overrides_today(trades_doc, day0: datetime) -> int:
+    return sum(1 for t in trades_doc["trades"]
+               if (t.get("override") or {}).get("size") == "half" and parse_t(t["opened_at"]) >= day0)
+
+
+# ---------------------------------------------------------------- the one gate for opening a practice trade
+
+def gate_new_trade(trades_doc: dict, sig: dict, feats: dict, now: datetime) -> dict:
+    """Decide whether a signal (already passed by the learning filter) opens a practice trade.
+    Order: pauses that this signal cannot override -> session rules -> high-confidence exception sizing -> free cash.
+    Returns dict(allowed, collateral, session, override, reason, why, all_reasons, extra)."""
+    conf = sig.get("confidence") or 0
+    scfg, ocfg = get_session_cfg(trades_doc), get_override_cfg(trades_doc)
+    sess = session_at(now, scfg) if scfg else None
+    res = dict(allowed=False, collateral=COLLATERAL, session=sess["name"] if sess else None, override=None,
+               reason=None, why=None, all_reasons=[], extra={})
+
+    def block(reason, why=None, **extra):
+        res.update(reason=reason, why=why or reason, extra=extra)
+        res["all_reasons"] = res["all_reasons"] or [reason]
+        return res
+
+    # pauses (protection + session slot rules)
+    pauses = []
+    prot = protection_state(trades_doc, now)
+    if prot:
+        pauses += [dict(b) for b in prot["blocked_by"]]
+    if sess:
+        opens = [t for t in trades_doc["trades"] if t["status"] == "open"]
+        cap = int(dict(DEFAULT_PROTECTION, **(get_rules(trades_doc).get("protection") or {}))["max_open"])
+        lim = cap - int(scfg["prime_reserved_slots"])
+        if sess["name"] != "prime" and len(opens) >= lim and len(opens) < cap:
+            pauses.append(dict(rule="prime_reserved", reason="slots reserved for NY prime",
+                               why=f"slots reserved for NY prime: {len(opens)} open, outside prime new trades "
+                                   f"need fewer than {lim} open"))
+        q = sum(t.get("session") == "quiet" for t in opens)
+        if sess["name"] == "quiet" and q >= int(scfg["quiet_max_open"]):
+            pauses.append(dict(rule="quiet_cap", reason=f"quiet-hours cap ({int(scfg['quiet_max_open'])})",
+                               why=f"quiet-hours cap ({int(scfg['quiet_max_open'])}): {q} trades opened in quiet "
+                                   f"hours are still open"))
+    pauses.sort(key=lambda b: PAUSE_ORDER.index(b["rule"]) if b["rule"] in PAUSE_ORDER else 99)
+    res["all_reasons"] = [b["reason"] for b in pauses]
+    allowed_rules = set((ocfg or {}).get("full_size", [])) | set((ocfg or {}).get("half_size", []))
+    high = bool(ocfg) and conf >= ocfg["override_min_confidence"]
+    if pauses:
+        hard = [b for b in pauses if not high or b["rule"] not in allowed_rules]
+        if hard:
+            b = hard[0]
+            return block(b["reason"], b["why"])
+
+    # session rules (never overridden)
+    if sess:
+        if is_ny_open_candle(sig, now, scfg):
+            return block("NY open candle, wait for next bar",
+                         f"NY open candle, wait for next bar: the {style_cfg(sig['style'])['primary']} candle opening "
+                         f"at the NY open ({uae(sess['ny_open'])}) is skipped; the next closed bar can enter")
+        need, need_htf, lab = session_min_conf(sig["style"], sess, now, scfg)
+        if conf < need:
+            r = f"{lab} need {need}%+"
+            return block(r, f"{r}: this signal is {conf}%", required_confidence=need)
+        if need_htf and feats.get("higher_tf_agrees") is not True:
+            hi = feats.get("higher_tf") or "higher chart"
+            return block("quiet hours need higher-timeframe agreement",
+                         f"quiet hours need higher-timeframe agreement: the {hi} Supertrend "
+                         f"{'does not agree' if feats.get('higher_tf_agrees') is False else 'is unknown'}")
+
+    # high-confidence exception (>= override_min_confidence)
+    if pauses:
+        rules_hit = [b["rule"] for b in pauses]
+        size = "full"
+        if any(r in ocfg["half_size"] for r in rules_hit):
+            day0 = now.astimezone(app.LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+            if _half_overrides_today(trades_doc, day0) >= int(ocfg["half_size_per_day"]):
+                b = next(b for b in pauses if b["rule"] in ocfg["half_size"])
+                return block(b["reason"], b["why"] + f"; the {ocfg['override_min_confidence']}%+ half-size exception was already used today")
+            size = "half"
+            res["collateral"] = COLLATERAL * float(ocfg["half_size_frac"])
+        names = [b["reason"] for b in pauses]
+        res["override"] = dict(kind="high_confidence", min_confidence=ocfg["override_min_confidence"], confidence=conf,
+                               overrode=rules_hit, overrode_reasons=names, size=size,
+                               collateral_usd=res["collateral"],
+                               note=f"opened despite {' + '.join(names)} ({ocfg['override_min_confidence']}%+ exception, {size} size)")
+
+    # free cash
+    if not has_free_cash(trades_doc, now, res["collateral"]):
+        a = account_state(trades_doc, now)
+        res["override"] = None
+        return block("not enough free cash", "not enough free cash", free_cash_usd=a["free_cash_usd"],
+                     needed_usd=res["collateral"])
+    res["allowed"] = True
+    return res
+
+
+def tag_sessions(trades_doc: dict, cfg: dict) -> int:
+    """Tag trades opened before sessions were switched on with the session of their open time."""
+    n = 0
+    for t in trades_doc["trades"]:
+        if not t.get("session"):
+            t["session"] = session_at(parse_t(t["opened_at"]), cfg)["name"]
+            t["session_tagged"] = "from open time (before session rules)"
+            n += 1
+    return n
+
+
+def enable_sessions(ledger: "Ledger", now=None, override_min_confidence: float | None = None) -> dict:
+    """Switch on session rules + the high-confidence exception for this ledger (trades.json backed up first)."""
+    now = now or utcnow()
+    trades_doc, _ = ledger.load()
+    rules = trades_doc.setdefault("rules", {})
+    rules["sessions"] = dict(DEFAULT_SESSIONS, **(rules.get("sessions") or {}))
+    rules["high_conf_override"] = dict(DEFAULT_OVERRIDE, **(rules.get("high_conf_override") or {}))
+    if override_min_confidence is not None:
+        rules["high_conf_override"]["override_min_confidence"] = float(override_min_confidence)
+    rules.setdefault("sessions_enabled_at", now.isoformat())
+    rules["updated_at"] = now.isoformat()
+    tagged = tag_sessions(trades_doc, rules["sessions"])
+    ledger._write(ledger.trades_path, trades_doc)
+    return dict(rules=rules, trades_tagged=tagged)
 
 
 def set_starting_balance(ledger: "Ledger", amount: float, start_time: str | None = None) -> dict:
@@ -1031,7 +1322,7 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
     funding_fn = funding_fn or fetch_funding
     trades_doc, learning = ledger.load()
     out = dict(ledger=str(ledger.root), run_time_uae=uae(now), opened=[], closed=[], not_opened=[],
-               open_trades=[], totals={}, account=None, protection=None, partial_closes=[], stop_moves=[],
+               open_trades=[], totals={}, account=None, protection=None, session=None, partial_closes=[], stop_moves=[],
                learning={}, warnings=[])
     runners = get_rules(trades_doc).get("let_winners_run")
     events = []
@@ -1111,23 +1402,25 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
             out["not_opened"].append(dict(pair=sig["pair"], style=sig["style"], side=sig["side"],
                                           why="a paper trade for this pair + style is already open"))
             continue
-        prot = protection_state(trades_doc, now)
-        if prot and not prot["new_trades_allowed"]:
-            b = prot["blocked_by"][0]
-            out["not_opened"].append(dict(pair=sig["pair"], style=sig["style"], side=sig["side"],
-                                          confidence=sig.get("confidence"), entry_tf=sig.get("timeframe"),
-                                          why=b["why"], reason=b["reason"],
-                                          all_reasons=[x["reason"] for x in prot["blocked_by"]]))
-            continue
-        if not has_free_cash(trades_doc, now):
-            a = account_state(trades_doc, now)
-            out["not_opened"].append(dict(pair=sig["pair"], style=sig["style"], side=sig["side"],
-                                          confidence=sig.get("confidence"), entry_tf=sig.get("timeframe"),
-                                          why="not enough free cash", reason="not enough free cash",
-                                          free_cash_usd=a["free_cash_usd"], needed_usd=COLLATERAL))
+        g = gate_new_trade(trades_doc, s2, feats, now)
+        if not g["allowed"]:
+            item = dict(pair=sig["pair"], style=sig["style"], side=sig["side"],
+                        confidence=sig.get("confidence"), entry_tf=sig.get("timeframe"),
+                        why=g["why"], reason=g["reason"], **g["extra"])
+            if g["all_reasons"] and g["all_reasons"] != [g["reason"]]:
+                item["all_reasons"] = g["all_reasons"]
+            if g["session"]:
+                item["session"] = g["session"]
+            out["not_opened"].append(item)
             continue
         t = open_trade(s2, now, feats, tags, probe=verdict["probe"], funding=fr,
-                       required=verdict["required_confidence"])
+                       required=verdict["required_confidence"], collateral=g["collateral"])
+        if g["session"]:
+            t["session"] = g["session"]
+            t["features"]["session"] = g["session"]
+        if g["override"]:
+            t["override"] = g["override"]
+            t["note"] = (t["note"] + " " if t["note"] else "") + g["override"]["note"]
         if runners:
             init_mgmt(t, now, runners)
         trades_doc["trades"].append(t)
@@ -1141,6 +1434,7 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
     prot = protection_state(trades_doc, now)
     protection_flags(trades_doc, prot, now)
     out["protection"] = prot
+    out["session"] = session_state(trades_doc, now)
     ledger.save(trades_doc, learning)
     if changes:
         with open(ledger.changes_txt, "a", encoding="utf-8") as fh:
@@ -1213,23 +1507,25 @@ def seed_from_state(ledger: Ledger, state_path: Path, now=None, day_uae: str | N
         if any(t["status"] == "open" and t["pair"] == pair and t["style"] == style for t in trades_doc["trades"]):
             item["opened"], item["why"] = False, "already open"
             continue
-        prot = protection_state(trades_doc, now)
-        if prot and not prot["new_trades_allowed"]:
-            item["opened"], item["why"] = False, prot["blocked_by"][0]["reason"]
-            continue
-        if not has_free_cash(trades_doc, now):
-            item["opened"], item["why"] = False, "not enough free cash"
-            continue
         s = r["long"] if side == "LONG" else r["short"]
         sig = dict(pair=pair, style=style, side=side, confidence=s["confidence"], entry=s["entry"], stop=s["stop"],
                    target=s["target"], backtest_expectancy_r=s["bt_exp_r"], backtest_trades=s["bt_n"],
                    backtest_win_rate=s["bt_win_rate"], opened_at=now.isoformat(), signal_time=a["time"],
                    funding_rate_8h=r.get("funding_rate"))
         feats = compute_features(sig)
+        g = gate_new_trade(trades_doc, sig, feats, now)
+        if not g["allowed"]:
+            item["opened"], item["why"] = False, g["reason"]
+            continue
         tags = entry_tags(feats)
         t = open_trade(sig, now, feats, tags, funding=(r.get("funding_rate"), "scan", False), required=BASE_MIN_CONF,
+                       collateral=g["collateral"],
                        note=f"Seeded late from the {uae(a['time'])} alert (alert price {a['price']}); "
                             f"entry is the price when the paper trade was opened, stop/target re-worked from it.")
+        if g["session"]:
+            t["session"] = g["session"]
+        if g["override"]:
+            t["override"] = g["override"]
         if get_rules(trades_doc).get("let_winners_run"):
             init_mgmt(t, now, get_rules(trades_doc)["let_winners_run"])
         trades_doc["trades"].append(t)
@@ -1269,6 +1565,29 @@ def protection_lines(prot: dict) -> list[str]:
     return L
 
 
+def session_lines(ss: dict) -> list[str]:
+    th = ss["thresholds"]
+    uniq = {}
+    for st, v in th.items():
+        uniq.setdefault((v["min_confidence"], v["needs_higher_tf_agreement"]), []).append(st)
+    parts = [f"{c}%{' + higher chart agrees' if h else ''} for {', '.join(sts)}" for (c, h), sts in uniq.items()]
+    L = [f"Session now: {ss['name'].upper()} · " + "; ".join(parts)]
+    L.append(f"  Open trades {ss['open_trades']} · new trades need fewer than {ss['open_trade_limit']} open"
+             + (" (2 slots kept for NY prime)" if not ss["in_prime_now"] else "")
+             + f" · quiet-hours trades open {ss['quiet_opened_open_trades']} of max {ss['quiet_max_open']}")
+    if ss.get("prime_today_uae"):
+        L.append(f"  Today: NY open {ss['ny_open_uae']}, prime {ss['prime_today_uae']} UAE, "
+                 f"NY-open candle skipped {ss['ny_open_candle_skip_uae']}")
+    if ss.get("next_prime_uae"):
+        L.append(f"  {'Prime now, until' if ss['in_prime_now'] else 'Next prime'}: {ss['next_prime_uae']['text']}")
+    o = ss.get("high_conf_override")
+    if o:
+        L.append(f"  {o['min_confidence']}%+ exception: full size despite profit lock / 6-trade cap / prime slots; half size despite "
+                 f"the daily loss limit ({o['half_size_left_today']} left today); never despite the weekly limit "
+                 f"or quiet-hours cap")
+    return L
+
+
 def summary_text(ledger: Ledger, now=None) -> str:
     now = now or utcnow()
     trades_doc, learning = ledger.load()
@@ -1288,6 +1607,9 @@ def summary_text(ledger: Ledger, now=None) -> str:
     prot = protection_state(trades_doc, now)
     if prot:
         L += protection_lines(prot) + [""]
+    ss = session_state(trades_doc, now)
+    if ss:
+        L += session_lines(ss) + [""]
     if tot["closed_trades"]:
         L.append(f"Closed trades: {tot['closed_trades']} · won {tot['wins']} · lost {tot['losses']} · "
                  f"win rate {tot['win_rate_pct']:.0f}% · total P&L ${tot['total_pnl_usd']:+,.2f} after costs "
@@ -1306,6 +1628,10 @@ def summary_text(ledger: Ledger, now=None) -> str:
                 mg = f" · half booked ${booked_partial_usd(t):+,.2f} at target, rest trailing"
             elif m["be_moved"]:
                 mg = " · stop at break-even"
+        if t.get("override"):
+            mg += f" · {t['override']['note']}"
+        if t.get("session"):
+            mg += f" · {t['session']}"
         L.append(f"  • {t['pair']} {t['style']} {t['side']} from {fmtp(t['entry'])} (stop {fmtp(t['stop'])}, "
                  f"target {fmtp(t['target'])}) · now {fmtp(t.get('last_price'))} · {u}{mg} · open {v['held']}, "
                  f"closes by {v['closes_by_uae']}")
@@ -1349,6 +1675,10 @@ def main(argv=None) -> int:
     ap.add_argument("--enable-protection", action="store_true",
                     help="switch on account protection (daily/weekly loss limits, profit lock, max 6 open) and "
                          "let-winners-run (break-even at +1R, half at target, ATR trail) for this ledger")
+    ap.add_argument("--enable-sessions", action="store_true",
+                    help="switch on session rules (NY prime / normal / quiet, UAE time) and the high-confidence (75%%+) exception")
+    ap.add_argument("--override-min-confidence", type=float,
+                    help="with --enable-sessions: confidence needed to open despite a pause (default 75)")
     ap.add_argument("--daily-goal", type=float, help="with --enable-protection: daily goal for the profit lock (USD)")
     ap.add_argument("--allow-no-dedupe", action="store_true", help="open trades even if the scan used --no-state (tests)")
     a = ap.parse_args(argv)
@@ -1359,12 +1689,21 @@ def main(argv=None) -> int:
             print(json.dumps(set_starting_balance(led, a.starting_balance, a.account_start), indent=2, default=str))
         finally:
             led.unlock()
-        if not (a.run or a.seed_from_state or a.summary or a.enable_protection):
+        if not (a.run or a.seed_from_state or a.summary or a.enable_protection or a.enable_sessions):
             return 0
     if a.enable_protection or a.daily_goal is not None:
         led.lock()
         try:
             print(json.dumps(enable_protection(led, a.daily_goal), indent=2, default=str))
+        finally:
+            led.unlock()
+        if not (a.run or a.seed_from_state or a.summary or a.enable_sessions):
+            return 0
+    if a.enable_sessions:
+        led.lock()
+        try:
+            print(json.dumps(enable_sessions(led, override_min_confidence=a.override_min_confidence), indent=2,
+                             default=str))
         finally:
             led.unlock()
         if not (a.run or a.seed_from_state or a.summary):
