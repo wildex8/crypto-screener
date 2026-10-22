@@ -225,6 +225,17 @@ As always: **not financial advice.** A GO is a set of conditions lining up, not 
 python paper_trader.py --summary                     # plain summary + lessons learned
 python paper_trader.py --run --scan last_run.json    # what the scanner job runs after each scan
 ```
+### Account protection and letting winners run
+
+Switched on per ledger with `python paper_trader.py --enable-protection [--daily-goal 500]` (stored in `trades.json` under `rules`). All limits use **realised** P&L after costs (closed trades plus half-positions already booked), with days and weeks in UAE time (the week starts Monday 00:00 UAE). Limits are a % of the account, so they grow with it, and once hit they hold for the rest of the day or week.
+
+- **Daily loss limit:** once today is down 3% of the account value at 00:00 UAE, no new trades until the next UAE day.
+- **Profit lock:** once today reaches the daily goal (+$500), falling back to half of the day's peak stops new trades for the day.
+- **Weekly limit:** once the week is down 8% of the value at Monday 00:00 UAE, no new trades until next Monday.
+- **Open trade cap:** at most 6 open trades.
+- Open trades are never force-closed by these rules. Skipped signals appear under `paper.not_opened` with the reason; status is in `paper.protection` (`just_triggered` lists a limit the first time it is hit).
+- **Let winners run:** at +1R the stop moves to break-even plus costs. At the original target half is closed and booked, and the rest is trailed with an ATR(14) x Supertrend-multiplier stop on the trade's own timeframe (only ever tightens; may run up to 2x the normal max hold). A trade is still one result: its P&L and R include the booked half, R on the full position.
+
 The ledger lives in `/workspace/scanner/paper/` on Grok Bot's computer (`trades.json`, `learning.json`, with backups before every write).
 
 ---

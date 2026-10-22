@@ -40,6 +40,31 @@ LEARNING (learning.json, human log learning_changes.txt):
   per new result once the bucket recovers; good probes unblock early. The core
   strategy code is never changed.
 
+ACCOUNT PROTECTION + LET WINNERS RUN (trades.json "rules" section; switched on with
+--enable-protection, ledgers without it behave exactly as before):
+  All P&L here is REALISED P&L after costs (closed trades + half-positions already
+  booked), by booking time. Unrealised P&L is not counted (it is shown, not used).
+  Days and weeks are UAE time (Asia/Dubai, UTC+4); the week starts Monday 00:00 UAE.
+  - Daily loss limit: once today's realised P&L has reached -3% of the account value
+    at 00:00 UAE, no new trades until the next UAE day. Open trades keep their stops.
+  - Profit lock: once today's realised P&L has reached the daily goal (+$500,
+    --daily-goal), if it then falls back to half of the day's peak, no new trades for
+    the rest of the day. Open trades are never force-closed.
+  - Weekly limit: once the week's realised P&L has reached -8% of the account value
+    at Monday 00:00 UAE, no new trades until next Monday (flagged once: just_triggered).
+  - Open trade cap: at most 6 open trades; existing ones are never closed for it.
+  Limits are sticky: a later winner does not re-open trading for that day/week.
+  Let winners run (new and already-open trades, from when the rules were switched on):
+  - at +1R (price moved by the initial stop distance in our favour) the stop moves to
+    break-even plus costs (fees, slippage and funding to the deadline);
+  - at the original target half the position is closed and booked; the other half is
+    trailed with an ATR(14) x Supertrend-multiplier chandelier stop on the trade's own
+    timeframe (best price since the target minus k x ATR; k = the style's Supertrend
+    multiplier). The stop only ever tightens; the liquidation check stays. The
+    runner may stay open up to 2x the style's normal max hold.
+  - One trade = one result: pnl_usd / r_multiple of a closed trade include the booked
+    half (R on the full position's initial risk); partials[] lists the half closes.
+
 Usage:
   python paper_trader.py --run [--scan last_run.json] [--ledger DIR]     (used by run.sh)
   python paper_trader.py --summary [--ledger DIR]
@@ -95,6 +120,18 @@ BLOCK_DAYS = 14
 PROBE_EVERY = 4
 BLOCK_EXP_R = -0.5
 BLOCK_MAX_WR = 30.0
+
+# account protection + let winners run (defaults; stored in trades.json "rules")
+DEFAULT_PROTECTION = dict(daily_loss_pct=3.0, daily_goal_usd=500.0, giveback_frac=0.5,
+                          weekly_loss_pct=8.0, max_open=6)
+DEFAULT_RUNNERS = dict(breakeven_at_r=1.0, partial_frac=0.5, atr_period=14, runner_hold_mult=2.0)
+
+REASON_TEXT = {
+    "stop": "hit its stop", "liq": "was liquidated", "target": "hit its target",
+    "timeout": "closed at the time limit", "breakeven": "closed at break-even (stop had moved to entry + costs)",
+    "trail": "closed by the trailing stop after half was booked at target",
+    "timeout_runner": "closed at the time limit after half was booked at target",
+}
 
 TAG_WORDS = {
     "low_adx": "low-ADX (weak trend)",
@@ -261,34 +298,137 @@ def fetch_funding(pair):
 
 # ---------------------------------------------------------------- trade maths
 
-def pnl_breakdown(t: dict, exit_px: float, hours: float, liquidated=False) -> dict:
+def pnl_part(t: dict, exit_px: float, hours: float, frac: float = 1.0, liquidated=False) -> dict:
+    """P&L after costs of `frac` of the position closed at exit_px. R and % are on the FULL position."""
     d = t["dir"]
     slip = t["slippage"]
     exit_fill = exit_px * (1 - d * slip)
-    qty = t["qty"]
+    qty = t["qty"] * frac
     gross = d * qty * (exit_fill - t["entry_fill"])
-    fees = app.TAKER_FEE * (t["notional"] + qty * exit_fill)
-    funding = t["notional"] * abs(t["funding_rate_8h"]) * hours / 8
+    fees = app.TAKER_FEE * (t["notional"] * frac + qty * exit_fill)
+    funding = t["notional"] * frac * abs(t["funding_rate_8h"]) * hours / 8
     slip_cost = qty * t["entry"] * slip + qty * exit_px * slip
     pnl = gross - fees - funding
+    cap = t["collateral"] * frac
     if liquidated:
-        pnl = -t["collateral"]
-    pnl = max(pnl, -t["collateral"])
+        pnl = -cap
+    pnl = max(pnl, -cap)
     return dict(exit_fill=exit_fill, gross_usd=gross, fees_usd=fees, funding_usd=funding,
                 slippage_usd=slip_cost, pnl_usd=pnl, pnl_pct_collateral=pnl / t["collateral"] * 100,
                 r_multiple=pnl / t["planned_risk_usd"] if t["planned_risk_usd"] > 0 else 0.0)
 
 
-def walk_trade(t: dict, df: pd.DataFrame, now: datetime) -> dict | None:
-    """Replay candles in order. Mutates t (last_checked, last_price) and returns
-    a close dict if the trade closed, else None."""
+def pnl_breakdown(t: dict, exit_px: float, hours: float, liquidated=False) -> dict:
+    return pnl_part(t, exit_px, hours, 1.0, liquidated)
+
+
+def remaining_frac(t: dict) -> float:
+    return float((t.get("mgmt") or {}).get("remaining_frac", 1.0))
+
+
+def booked_partial_usd(t: dict) -> float:
+    return sum(p["pnl_usd"] for p in t.get("partials") or [])
+
+
+# ---------------------------------------------------------------- let winners run
+
+def get_rules(trades_doc: dict) -> dict:
+    return trades_doc.get("rules") or {}
+
+
+def init_mgmt(t: dict, now: datetime, runners: dict) -> dict:
+    """Start break-even / partial / trailing management for a trade (new or already open)."""
+    if t.get("mgmt"):
+        return t["mgmt"]
+    cfg = style_cfg(t["style"])
     d = t["dir"]
+    risk_px = abs(t["entry_fill"] - t["stop"])
+    t["mgmt"] = dict(
+        since=now.isoformat(), initial_stop=t["stop"], initial_deadline=t["deadline"], risk_px=risk_px,
+        be_trigger=t["entry_fill"] + d * runners.get("breakeven_at_r", 1.0) * risk_px,
+        be_moved=False, be_price=None, partial_frac=runners.get("partial_frac", 0.5), partial_done=False,
+        remaining_frac=1.0, trail_active=False, trail_stop=None, best_price=None,
+        trail_mult=float(cfg["st_mult"]), atr_period=int(runners.get("atr_period", 14)),
+        runner_hold_mult=float(runners.get("runner_hold_mult", 2.0)), last_atr=None, events=[])
+    t.setdefault("partials", [])
+    return t["mgmt"]
+
+
+def breakeven_price(t: dict) -> float:
+    """Price at which closing the rest of the trade nets $0 after fees, slippage and funding to the deadline."""
+    d, fee, slip = t["dir"], app.TAKER_FEE, t["slippage"]
+    frac = remaining_frac(t)
+    qty, N = t["qty"] * frac, t["notional"] * frac
+    hours = max((parse_t(t["deadline"]) - parse_t(t["opened_at"])).total_seconds() / 3600, 0)
+    F = N * abs(t["funding_rate_8h"]) * hours / 8
+    xf = (qty * t["entry_fill"] + d * (fee * N + F)) / (qty * (1 - d * fee))
+    return xf / (1 - d * slip)
+
+
+def fallback_atr(t: dict) -> float:
+    f = t.get("features") or {}
+    if f.get("atr_pct"):
+        return float(f["atr_pct"]) / 100 * t["entry"]
+    risk = abs(t["entry"] - (t.get("mgmt") or {}).get("initial_stop", t["stop"]))
+    return risk / float(style_cfg(t["style"]).get("stop_atr", 2.0))
+
+
+def make_atr_lookup(t: dict, now: datetime, loader=None):
+    """ATR on the trade's own timeframe, as known at a given time (last candle closed before it)."""
+    cache = {}
+    loader = loader or (lambda p, tf, n: app.load_klines(p, tf, n, budget_s=30))
+    n_atr = int((t.get("mgmt") or {}).get("atr_period", 14))
+
+    def series():
+        tf = t["entry_tf"]
+        iv = app.INTERVAL_SECONDS[tf]
+        since = parse_t(t["opened_at"])
+        need = int(math.ceil((now - since).total_seconds() / iv)) + 5 * n_atr
+        try:
+            df, _, _ = loader(t["pair"], tf, min(max(need, 5 * n_atr), 1500))
+        except Exception:
+            df = None
+        if df is None or df.empty or len(df) < n_atr + 1:
+            return None
+        df = df.copy()
+        df["close_time"] = df["time"] + pd.Timedelta(seconds=iv)
+        df = df[df["close_time"] <= pd.Timestamp(now)].reset_index(drop=True)
+        a = app.atr(df, n_atr)
+        out = pd.Series(a.to_numpy(), index=pd.DatetimeIndex(df["close_time"])).dropna()
+        return out if len(out) else None
+
+    def lookup(at: datetime) -> tuple[float, str]:
+        if "s" not in cache:
+            cache["s"] = series()
+        s = cache["s"]
+        if s is not None:
+            i = s.index.searchsorted(pd.Timestamp(at), side="right") - 1
+            if i >= 0:
+                v = float(s.iloc[i])
+                if v > 0 and not math.isnan(v):
+                    return v, f"ATR({n_atr}) {t['entry_tf']}"
+        return fallback_atr(t), "ATR estimate from entry"
+    return lookup
+
+
+def _tighten(t: dict, new_stop: float) -> bool:
+    d = t["dir"]
+    if (d == 1 and new_stop > t["stop"]) or (d == -1 and new_stop < t["stop"]):
+        t["stop"] = new_stop
+        return True
+    return False
+
+
+def walk_trade(t: dict, df: pd.DataFrame, now: datetime, atr_lookup=None, events=None) -> dict | None:
+    """Replay candles in order. Mutates t (last_checked, last_price; with let-winners-run also stop,
+    mgmt, partials, deadline) and returns a close dict if the trade closed, else None.
+    Within a candle: the stop (or liquidation) is checked first, then the target, then the stop is
+    moved (break-even / trail) for the NEXT candle - so a candle never helps itself."""
+    d = t["dir"]
+    m = t.get("mgmt")
     opened = parse_t(t["opened_at"])
     last = parse_t(t["last_checked"]) if t.get("last_checked") else None
-    deadline = parse_t(t["deadline"])
-    stop, target, liq = t["stop"], t["target"], t["liquidation"]
-    adverse = max(stop, liq) if d == 1 else min(stop, liq)
-    adverse_is_liq = (liq >= stop) if d == 1 else (liq <= stop)
+    liq = t["liquidation"]
     if df is None or df.empty:
         return None
     for row in df.itertuples(index=False):
@@ -298,9 +438,13 @@ def walk_trade(t: dict, df: pd.DataFrame, now: datetime) -> dict | None:
                 continue
         elif ct <= last:                     # already processed
             continue
+        stop, target = t["stop"], t["target"]
+        deadline = parse_t(t["deadline"])
+        adverse = max(stop, liq) if d == 1 else min(stop, liq)
+        adverse_is_liq = (liq >= stop) if d == 1 else (liq <= stop)
         o, h, l, c = float(row.open), float(row.high), float(row.low), float(row.close)
         hit_bad = (l <= adverse) if d == 1 else (h >= adverse)
-        hit_good = (h >= target) if d == 1 else (l <= target)
+        hit_good = ((h >= target) if d == 1 else (l <= target)) and not (m and m["partial_done"])
         exit_px, reason = None, None
         if hit_bad:                           # stop first if both are inside the candle
             gap = (o < adverse) if d == 1 else (o > adverse)
@@ -308,25 +452,82 @@ def walk_trade(t: dict, df: pd.DataFrame, now: datetime) -> dict | None:
             reason = "liq" if adverse_is_liq else "stop"
             if (d == 1 and exit_px <= liq) or (d == -1 and exit_px >= liq):
                 reason = "liq"
+            elif m and reason == "stop":
+                reason = "trail" if m["partial_done"] else ("breakeven" if m["be_moved"] else "stop")
+        elif hit_good and m:                  # book half at the target, trail the rest
+            hours = max((ct - opened).total_seconds() / 3600, 0)
+            frac = m["partial_frac"]
+            part = pnl_part(t, target, hours, frac)
+            t["partials"].append(dict(time=ct.isoformat(), time_uae=uae(ct), price=target, frac=frac,
+                                      reason="half closed at target", **{k: r2(v, 6) for k, v in part.items()}))
+            m.update(partial_done=True, remaining_frac=1.0 - frac, trail_active=True,
+                     best_price=(h if d == 1 else l))
+            t["deadline"] = (opened + timedelta(hours=t["max_hold_hours"] * m["runner_hold_mult"])).isoformat()
+            be = breakeven_price(t)
+            if not m["be_moved"]:
+                m.update(be_moved=True, be_price=be)
+            _tighten(t, be)
+            ev = dict(time_uae=uae(ct), kind="partial", text=f"half closed at target {app.fmt_price(target)} "
+                      f"(${part['pnl_usd']:+,.2f} booked); rest trails, stop {app.fmt_price(t['stop'])}",
+                      pnl_usd=r2(part["pnl_usd"]))
+            m["events"].append(ev)
+            if events is not None:
+                events.append(dict(ev, id=t["id"], pair=t["pair"], style=t["style"], side=t["side"]))
         elif hit_good:
             exit_px, reason = target, "target"
         elif ct >= deadline:
-            exit_px, reason = c, "timeout"
+            exit_px, reason = c, ("timeout_runner" if m and m["partial_done"] else "timeout")
         t["last_checked"] = ct.isoformat()
         t["last_price"] = c
         if reason:
-            exit_time = ct if reason == "timeout" else ct     # candle close time = when we know
+            exit_time = ct                                # candle close time = when we know
             hours = max((exit_time - opened).total_seconds() / 3600, 0)
-            return dict(exit_price=exit_px, reason=reason, exit_time=exit_time.isoformat(),
-                        held_hours=hours, **pnl_breakdown(t, exit_px, hours, liquidated=(reason == "liq")))
+            if not m or not t.get("partials"):
+                return dict(exit_price=exit_px, reason=reason, exit_time=exit_time.isoformat(),
+                            held_hours=hours, **pnl_breakdown(t, exit_px, hours, liquidated=(reason == "liq")))
+            fin = pnl_part(t, exit_px, hours, m["remaining_frac"], liquidated=(reason == "liq"))
+            parts = t["partials"]
+            agg = {k: fin[k] + sum(p[k] for p in parts) for k in ("gross_usd", "fees_usd", "funding_usd",
+                                                               "slippage_usd", "pnl_usd")}
+            pnl = agg["pnl_usd"]
+            avg_exit = (exit_px * m["remaining_frac"] + sum(p["price"] * p["frac"] for p in parts))
+            return dict(exit_price=exit_px, reason=reason, exit_time=exit_time.isoformat(), held_hours=hours,
+                        exit_fill=fin["exit_fill"], **agg, pnl_pct_collateral=pnl / t["collateral"] * 100,
+                        r_multiple=pnl / t["planned_risk_usd"] if t["planned_risk_usd"] > 0 else 0.0,
+                        final_part_pnl_usd=fin["pnl_usd"], avg_exit_price=avg_exit)
+        if m:                                             # move the stop for the next candle
+            moved = []
+            if not m["be_moved"] and ((h >= m["be_trigger"]) if d == 1 else (l <= m["be_trigger"])):
+                be = breakeven_price(t)
+                m.update(be_moved=True, be_price=be)
+                if _tighten(t, be):
+                    moved.append(f"stop moved to break-even + costs {app.fmt_price(be)} (trade reached +1R)")
+            if m["trail_active"]:
+                m["best_price"] = max(m["best_price"], h) if d == 1 else min(m["best_price"], l)
+                a, src = atr_lookup(ct) if atr_lookup else (fallback_atr(t), "ATR estimate from entry")
+                m["last_atr"], m["atr_source"] = a, src
+                trail = m["best_price"] - d * m["trail_mult"] * a
+                old = t["stop"]
+                if _tighten(t, trail):
+                    m["trail_stop"] = t["stop"]
+                    if abs(t["stop"] - old) / old > 0.001:
+                        moved.append(f"trailing stop tightened to {app.fmt_price(t['stop'])}")
+            for txt in moved:
+                ev = dict(time_uae=uae(ct), kind="stop_move", text=txt, stop=t["stop"])
+                m["events"].append(ev)
+                if events is not None:
+                    events.append(dict(ev, id=t["id"], pair=t["pair"], style=t["style"], side=t["side"]))
+            if len(m["events"]) > 40:
+                m["events"] = m["events"][-40:]
     return None
 
 
 def unrealised(t: dict, now: datetime) -> dict | None:
+    """Unrealised P&L of what is still open (the runner half after a partial close)."""
     if t.get("last_price") is None:
         return None
     hours = (now - parse_t(t["opened_at"])).total_seconds() / 3600
-    return pnl_breakdown(t, t["last_price"], hours)
+    return pnl_part(t, t["last_price"], hours, remaining_frac(t))
 
 
 # ---------------------------------------------------------------- features & tags
@@ -394,9 +595,9 @@ def postmortem_tags(t: dict) -> list[str]:
     if t["pnl_usd"] > 0:
         return []
     tags = list(t.get("entry_tags", []))
-    if t["reason"] in ("stop", "liq") and t["held_hours"] < 0.25 * t["max_hold_hours"]:
+    if t["reason"] in ("stop", "liq", "breakeven") and t["held_hours"] < 0.25 * t["max_hold_hours"]:
         tags.insert(0, "quick_stop")
-    if t["reason"] == "timeout":
+    if t["reason"] in ("timeout", "timeout_runner"):
         tags.insert(0, "timeout_loss")
     return tags
 
@@ -589,7 +790,12 @@ def closed_view(t):
                 fees_usd=r2(t["fees_usd"]), funding_usd=r2(t["funding_usd"]), slippage_usd=r2(t["slippage_usd"]),
                 r_multiple=r2(t["r_multiple"]), held=dur(t["held_hours"]), held_hours=r2(t["held_hours"]),
                 opened_uae=uae(t["opened_at"]), closed_uae=uae(t["exit_time"]),
-                loss_tags=t.get("loss_tags", []), probe=t.get("probe", False))
+                loss_tags=t.get("loss_tags", []), probe=t.get("probe", False),
+                reason_text=REASON_TEXT.get(t["reason"], t["reason"]),
+                half_closed_at_target=bool(t.get("partials")),
+                booked_at_target_usd=r2(booked_partial_usd(t)) if t.get("partials") else None,
+                final_part_pnl_usd=r2(t.get("final_part_pnl_usd")) if t.get("partials") else None,
+                initial_stop=(t.get("mgmt") or {}).get("initial_stop", t.get("stop")))
 
 
 def opened_view(t):
@@ -608,7 +814,19 @@ def open_view(t, now):
                 unrealised_pct_collateral=r2(u["pnl_pct_collateral"]) if u else None,
                 held=dur((now - parse_t(t["opened_at"])).total_seconds() / 3600),
                 opened_uae=uae(t["opened_at"]), closes_by_uae=uae(t["deadline"]),
-                last_checked_uae=uae(t["last_checked"]) if t.get("last_checked") else None)
+                last_checked_uae=uae(t["last_checked"]) if t.get("last_checked") else None,
+                **mgmt_view(t))
+
+
+def mgmt_view(t) -> dict:
+    m = t.get("mgmt")
+    if not m:
+        return {}
+    return dict(initial_stop=m["initial_stop"], breakeven_moved=m["be_moved"],
+                breakeven_at=r2(m["be_trigger"], 8), half_closed_at_target=m["partial_done"],
+                booked_at_target_usd=r2(booked_partial_usd(t)) if t.get("partials") else None,
+                remaining_pct=round(m["remaining_frac"] * 100), trailing=m["trail_active"],
+                trail_stop=r2(m.get("trail_stop"), 8), managed_since_uae=uae(m["since"]))
 
 
 def account_state(trades_doc, now, extra_open=None) -> dict | None:
@@ -622,21 +840,156 @@ def account_state(trades_doc, now, extra_open=None) -> dict | None:
     inside = [t for t in trades_doc["trades"] if since is None or parse_t(t["opened_at"]) >= since]
     closed = [t for t in inside if t["status"] == "closed"]
     opens = [t for t in inside if t["status"] == "open"]
-    realised = sum(t["pnl_usd"] for t in closed)
+    booked_open = sum(booked_partial_usd(t) for t in opens)        # half closes already booked
+    realised = sum(t["pnl_usd"] for t in closed) + booked_open
     value = start + realised
-    in_use = sum(t.get("collateral", COLLATERAL) for t in opens)
+    in_use = sum(t.get("collateral", COLLATERAL) * remaining_frac(t) for t in opens)
     unr = [unrealised(t, now) for t in opens]
     unr_usd = sum(u["pnl_usd"] for u in unr if u)
     equity = value + unr_usd
     free = value - in_use
     return dict(
         starting_balance_usd=r2(start), start_uae=uae(acc["start_time"]) if acc.get("start_time") else None,
-        realised_pnl_usd=r2(realised), account_value_usd=r2(value),
+        realised_pnl_usd=r2(realised), booked_on_open_trades_usd=r2(booked_open), account_value_usd=r2(value),
         collateral_in_use_usd=r2(in_use), open_trades=len(opens), free_cash_usd=r2(free),
         unrealised_pnl_usd=r2(unr_usd), equity_usd=r2(equity),
         return_pct=r2((value - start) / start * 100), equity_return_pct=r2((equity - start) / start * 100),
         collateral_per_trade_usd=COLLATERAL, can_open_new_trade=free >= COLLATERAL,
         sizing="fixed $1,000 collateral ($5,000 at 5x) per trade - not compounding yet")
+
+
+def bookings(trades_doc) -> list[tuple[datetime, float]]:
+    """Realised P&L events (time, usd) inside the account window: half closes and final closes."""
+    acc = trades_doc.get("account") or {}
+    since = parse_t(acc["start_time"]) if acc.get("start_time") else None
+    out = []
+    for t in trades_doc["trades"]:
+        if since is not None and parse_t(t["opened_at"]) < since:
+            continue
+        parts = t.get("partials") or []
+        for p in parts:
+            out.append((parse_t(p["time"]), float(p["pnl_usd"])))
+        if t["status"] == "closed":
+            out.append((parse_t(t["exit_time"]), float(t["pnl_usd"]) - sum(float(p["pnl_usd"]) for p in parts)))
+    return sorted(out, key=lambda x: x[0])
+
+
+def _period(B, start_value, t0, now, limit_pct):
+    """Running realised P&L from t0 to now; sticky limit check. Returns dict."""
+    run, peak, low, hit_at = 0.0, 0.0, 0.0, None
+    limit = -abs(limit_pct) / 100 * start_value
+    for tm, p in B:
+        if tm < t0 or tm > now:
+            continue
+        run += p
+        peak, low = max(peak, run), min(low, run)
+        if hit_at is None and run <= limit + 1e-9:
+            hit_at = tm
+    return dict(pnl=run, peak=peak, low=low, limit=limit, hit_at=hit_at)
+
+
+def protection_state(trades_doc, now, cfg=None) -> dict | None:
+    """Account protection status. None when the rules are not switched on for this ledger."""
+    rules = get_rules(trades_doc)
+    if cfg is None:
+        if not rules.get("protection"):
+            return None
+        cfg = dict(DEFAULT_PROTECTION, **rules["protection"])
+    open_n = sum(t["status"] == "open" for t in trades_doc["trades"])
+    loc = now.astimezone(app.LOCAL_TZ)
+    day0 = loc.replace(hour=0, minute=0, second=0, microsecond=0)
+    week0 = day0 - timedelta(days=day0.weekday())
+    nxt_day, nxt_week = day0 + timedelta(days=1), week0 + timedelta(days=7)
+    acc = trades_doc.get("account")
+    blocks = []
+    res = dict(rules=dict(cfg), basis="realised P&L after costs (closed trades + half closes booked), UAE time",
+               day_uae=f"{day0:%a %d %b %Y}", week_uae=f"week from Mon {week0:%d %b %Y}")
+    if acc and acc.get("starting_balance") is not None:
+        start = float(acc["starting_balance"])
+        B = bookings(trades_doc)
+        sod = start + sum(p for tm, p in B if tm < day0)
+        sow = start + sum(p for tm, p in B if tm < week0)
+        dy = _period(B, sod, day0, now, cfg["daily_loss_pct"])
+        wk = _period(B, sow, week0, now, cfg["weekly_loss_pct"])
+        # profit lock: after reaching the goal, falling back to (1 - giveback) of the peak so far
+        run, peak, armed_at, lock_at = 0.0, 0.0, None, None
+        for tm, p in B:
+            if tm < day0 or tm > now:
+                continue
+            run += p
+            peak = max(peak, run)
+            if armed_at is None and peak >= cfg["daily_goal_usd"] - 1e-9:
+                armed_at = tm
+            if armed_at is not None and lock_at is None and run <= peak * (1 - cfg["giveback_frac"]) + 1e-9:
+                lock_at = tm
+        res["today"] = dict(start_of_day_value_usd=r2(sod), realised_pnl_usd=r2(dy["pnl"]), peak_usd=r2(dy["peak"]),
+                            loss_limit_usd=r2(dy["limit"]), loss_limit_pct=cfg["daily_loss_pct"],
+                            limit_hit=dy["hit_at"] is not None, limit_hit_uae=uae(dy["hit_at"]) if dy["hit_at"] else None,
+                            room_left_usd=r2(max(dy["pnl"] - dy["limit"], 0)) if dy["hit_at"] is None else 0.0,
+                            daily_goal_usd=cfg["daily_goal_usd"], goal_reached=armed_at is not None,
+                            profit_lock_level_usd=r2(peak * (1 - cfg["giveback_frac"])) if armed_at else None,
+                            profit_lock_hit=lock_at is not None, profit_lock_uae=uae(lock_at) if lock_at else None)
+        res["week"] = dict(start_of_week_value_usd=r2(sow), realised_pnl_usd=r2(wk["pnl"]),
+                           loss_limit_usd=r2(wk["limit"]), loss_limit_pct=cfg["weekly_loss_pct"],
+                           limit_hit=wk["hit_at"] is not None, limit_hit_uae=uae(wk["hit_at"]) if wk["hit_at"] else None)
+        if wk["hit_at"]:
+            blocks.append(dict(rule="weekly", reason="weekly limit", until_uae=uae(nxt_week),
+                               why=f"weekly limit: the week is ${wk['pnl']:+,.0f} realised, past the "
+                                   f"-{cfg['weekly_loss_pct']:g}% limit (${wk['limit']:,.0f}); no new trades until "
+                                   f"Mon {nxt_week:%d %b} 00:00 UAE"))
+        if dy["hit_at"]:
+            blocks.append(dict(rule="daily_loss", reason="daily loss limit reached", until_uae=uae(nxt_day),
+                               why=f"daily loss limit reached: today is ${dy['pnl']:+,.0f} realised, past the "
+                                   f"-{cfg['daily_loss_pct']:g}% limit (${dy['limit']:,.0f}); no new trades until "
+                                   f"00:00 UAE"))
+        if lock_at:
+            blocks.append(dict(rule="profit_lock", reason="profit lock", until_uae=uae(nxt_day),
+                               why=f"profit lock: today peaked at ${peak:+,.0f} and fell back to half; "
+                                   f"keeping the day green, no new trades until 00:00 UAE"))
+    res["open"] = dict(open_trades=open_n, max_open=int(cfg["max_open"]), at_cap=open_n >= int(cfg["max_open"]))
+    if open_n >= int(cfg["max_open"]):
+        blocks.append(dict(rule="max_open", reason=f"max {int(cfg['max_open'])} open trades", until_uae=None,
+                           why=f"max {int(cfg['max_open'])} open trades: {open_n} are open; new trades resume "
+                               f"when fewer than {int(cfg['max_open'])} are open"))
+    res["new_trades_allowed"] = not blocks
+    res["blocked_by"] = blocks
+    res["status_text"] = ("New trades allowed." if not blocks else
+                          "New trades paused - " + "; ".join(b["reason"] for b in blocks) + ".")
+    return res
+
+
+def protection_flags(trades_doc, prot, now) -> list[dict]:
+    """Mark day/week limits the first time they are seen so the routine tells the user once."""
+    if not prot:
+        return []
+    flags = trades_doc.setdefault("protection_flags", {})
+    new = []
+    for b in prot["blocked_by"]:
+        if b["rule"] == "max_open":
+            continue
+        key = f"{b['rule']}|{prot['week_uae'] if b['rule'] == 'weekly' else prot['day_uae']}"
+        if key not in flags:
+            flags[key] = now.isoformat()
+            new.append(dict(rule=b["rule"], reason=b["reason"], why=b["why"], until_uae=b["until_uae"]))
+    cutoff = now - timedelta(days=21)
+    trades_doc["protection_flags"] = {k: v for k, v in flags.items() if parse_t(v) > cutoff}
+    prot["just_triggered"] = new
+    return new
+
+
+def enable_protection(ledger: "Ledger", daily_goal: float | None = None, now=None) -> dict:
+    """Switch on account protection + let-winners-run for this ledger (trades.json backed up first)."""
+    now = now or utcnow()
+    trades_doc, _ = ledger.load()
+    rules = trades_doc.get("rules") or {}
+    prot = dict(DEFAULT_PROTECTION, **(rules.get("protection") or {}))
+    if daily_goal is not None:
+        prot["daily_goal_usd"] = float(daily_goal)
+    trades_doc["rules"] = dict(
+        protection=prot, let_winners_run=dict(DEFAULT_RUNNERS, **(rules.get("let_winners_run") or {})),
+        enabled_at=rules.get("enabled_at") or now.isoformat(), updated_at=now.isoformat())
+    ledger._write(ledger.trades_path, trades_doc)
+    return trades_doc["rules"]
 
 
 def has_free_cash(trades_doc, now) -> bool:
@@ -678,7 +1031,10 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
     funding_fn = funding_fn or fetch_funding
     trades_doc, learning = ledger.load()
     out = dict(ledger=str(ledger.root), run_time_uae=uae(now), opened=[], closed=[], not_opened=[],
-               open_trades=[], totals={}, account=None, learning={}, warnings=[])
+               open_trades=[], totals={}, account=None, protection=None, partial_closes=[], stop_moves=[],
+               learning={}, warnings=[])
+    runners = get_rules(trades_doc).get("let_winners_run")
+    events = []
 
     # 1. update open trades
     for t in [t for t in trades_doc["trades"] if t["status"] == "open"]:
@@ -686,12 +1042,18 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
         df, tf, src, warn = load_fine_candles(t["pair"], since, now, loader=candle_loader)
         if warn:
             out["warnings"].append(warn)
-        res = walk_trade(t, df, now)
+        atr_lookup = None
+        if runners:
+            init_mgmt(t, now, runners)
+            atr_lookup = make_atr_lookup(t, now, loader=candle_loader)
+        res = walk_trade(t, df, now, atr_lookup=atr_lookup, events=events)
         t["last_data"] = f"{tf} {src}" if tf else None
         if res:
             t.update(res, status="closed")
             t["loss_tags"] = postmortem_tags(t)
             out["closed"].append(closed_view(t))
+    out["partial_closes"] = [e for e in events if e["kind"] == "partial"]
+    out["stop_moves"] = [e for e in events if e["kind"] == "stop_move"]
 
     # 2. learn
     changes = learn(trades_doc, learning, now)
@@ -749,6 +1111,14 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
             out["not_opened"].append(dict(pair=sig["pair"], style=sig["style"], side=sig["side"],
                                           why="a paper trade for this pair + style is already open"))
             continue
+        prot = protection_state(trades_doc, now)
+        if prot and not prot["new_trades_allowed"]:
+            b = prot["blocked_by"][0]
+            out["not_opened"].append(dict(pair=sig["pair"], style=sig["style"], side=sig["side"],
+                                          confidence=sig.get("confidence"), entry_tf=sig.get("timeframe"),
+                                          why=b["why"], reason=b["reason"],
+                                          all_reasons=[x["reason"] for x in prot["blocked_by"]]))
+            continue
         if not has_free_cash(trades_doc, now):
             a = account_state(trades_doc, now)
             out["not_opened"].append(dict(pair=sig["pair"], style=sig["style"], side=sig["side"],
@@ -758,6 +1128,8 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
             continue
         t = open_trade(s2, now, feats, tags, probe=verdict["probe"], funding=fr,
                        required=verdict["required_confidence"])
+        if runners:
+            init_mgmt(t, now, runners)
         trades_doc["trades"].append(t)
         out["opened"].append(opened_view(t))
 
@@ -766,6 +1138,9 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
     trades_doc["processed_signals"] = {k: v for k, v in trades_doc["processed_signals"].items()
                                        if parse_t(v["time"]) > cutoff}
     learning["updated_uae"] = uae(now)
+    prot = protection_state(trades_doc, now)
+    protection_flags(trades_doc, prot, now)
+    out["protection"] = prot
     ledger.save(trades_doc, learning)
     if changes:
         with open(ledger.changes_txt, "a", encoding="utf-8") as fh:
@@ -838,6 +1213,10 @@ def seed_from_state(ledger: Ledger, state_path: Path, now=None, day_uae: str | N
         if any(t["status"] == "open" and t["pair"] == pair and t["style"] == style for t in trades_doc["trades"]):
             item["opened"], item["why"] = False, "already open"
             continue
+        prot = protection_state(trades_doc, now)
+        if prot and not prot["new_trades_allowed"]:
+            item["opened"], item["why"] = False, prot["blocked_by"][0]["reason"]
+            continue
         if not has_free_cash(trades_doc, now):
             item["opened"], item["why"] = False, "not enough free cash"
             continue
@@ -851,6 +1230,8 @@ def seed_from_state(ledger: Ledger, state_path: Path, now=None, day_uae: str | N
         t = open_trade(sig, now, feats, tags, funding=(r.get("funding_rate"), "scan", False), required=BASE_MIN_CONF,
                        note=f"Seeded late from the {uae(a['time'])} alert (alert price {a['price']}); "
                             f"entry is the price when the paper trade was opened, stop/target re-worked from it.")
+        if get_rules(trades_doc).get("let_winners_run"):
+            init_mgmt(t, now, get_rules(trades_doc)["let_winners_run"])
         trades_doc["trades"].append(t)
         trades_doc["processed_signals"][pkey] = dict(time=now.isoformat(), passed=True, reason="seed")
         item.update(opened=True, entry=t["entry"], stop=t["stop"], target=t["target"], opened_uae=uae(now))
@@ -863,6 +1244,29 @@ def seed_from_state(ledger: Ledger, state_path: Path, now=None, day_uae: str | N
 
 def fmtp(x):
     return "-" if x is None else app.fmt_price(float(x))
+
+
+def protection_lines(prot: dict) -> list[str]:
+    L = ["Protection: " + prot["status_text"]]
+    if prot.get("today"):
+        d = prot["today"]
+        L.append(f"  Today (UAE): ${d['realised_pnl_usd']:+,.2f} realised vs daily loss limit ${d['loss_limit_usd']:,.2f} "
+                 f"(-{d['loss_limit_pct']:g}% of ${d['start_of_day_value_usd']:,.2f})"
+                 + (f" - HIT at {d['limit_hit_uae']}" if d["limit_hit"] else f" - ${d['room_left_usd']:,.2f} room left"))
+        L.append(f"  Daily goal ${d['daily_goal_usd']:,.0f}: " + (
+            ("profit lock HIT at " + d["profit_lock_uae"]) if d["profit_lock_hit"] else
+            (f"reached, peak ${d['peak_usd']:+,.2f}; lock if it falls to ${d['profit_lock_level_usd']:+,.2f}")
+            if d["goal_reached"] else f"not reached (peak ${d['peak_usd']:+,.2f})"))
+    if prot.get("week"):
+        w = prot["week"]
+        L.append(f"  Week: ${w['realised_pnl_usd']:+,.2f} realised vs weekly limit ${w['loss_limit_usd']:,.2f} "
+                 f"(-{w['loss_limit_pct']:g}% of ${w['start_of_week_value_usd']:,.2f})" + (" - HIT" if w["limit_hit"] else ""))
+    o = prot["open"]
+    L.append(f"  Open trades: {o['open_trades']} of max {o['max_open']}" + (" - at the cap" if o["at_cap"] else ""))
+    for b in prot["blocked_by"]:
+        if b.get("until_uae"):
+            L.append(f"  Paused by {b['reason']} until {b['until_uae']}")
+    return L
 
 
 def summary_text(ledger: Ledger, now=None) -> str:
@@ -881,6 +1285,9 @@ def summary_text(ledger: Ledger, now=None) -> str:
         L.append("")
     else:
         L += ["Account: no starting balance set (use --starting-balance).", ""]
+    prot = protection_state(trades_doc, now)
+    if prot:
+        L += protection_lines(prot) + [""]
     if tot["closed_trades"]:
         L.append(f"Closed trades: {tot['closed_trades']} · won {tot['wins']} · lost {tot['losses']} · "
                  f"win rate {tot['win_rate_pct']:.0f}% · total P&L ${tot['total_pnl_usd']:+,.2f} after costs "
@@ -892,8 +1299,15 @@ def summary_text(ledger: Ledger, now=None) -> str:
     for t in opens:
         v = open_view(t, now)
         u = "n/a yet" if v["unrealised_pnl_usd"] is None else f"${v['unrealised_pnl_usd']:+,.2f}"
+        mg = ""
+        if t.get("mgmt"):
+            m = t["mgmt"]
+            if m["partial_done"]:
+                mg = f" · half booked ${booked_partial_usd(t):+,.2f} at target, rest trailing"
+            elif m["be_moved"]:
+                mg = " · stop at break-even"
         L.append(f"  • {t['pair']} {t['style']} {t['side']} from {fmtp(t['entry'])} (stop {fmtp(t['stop'])}, "
-                 f"target {fmtp(t['target'])}) · now {fmtp(t.get('last_price'))} · {u} · open {v['held']}, "
+                 f"target {fmtp(t['target'])}) · now {fmtp(t.get('last_price'))} · {u}{mg} · open {v['held']}, "
                  f"closes by {v['closes_by_uae']}")
     closed = sorted([t for t in trades_doc["trades"] if t["status"] == "closed"], key=lambda t: t["exit_time"])
     if closed:
@@ -901,7 +1315,7 @@ def summary_text(ledger: Ledger, now=None) -> str:
         L.append("Last closed:")
         for t in closed[-10:]:
             L.append(f"  • {t['pair']} {t['style']} {t['side']} {fmtp(t['entry'])} -> {fmtp(t['exit_price'])} "
-                     f"{t['reason']} · ${t['pnl_usd']:+,.2f} ({t['pnl_pct_collateral']:+.1f}%) · held "
+                     f"{t['reason']}{' (half at target)' if t.get('partials') else ''} · ${t['pnl_usd']:+,.2f} ({t['pnl_pct_collateral']:+.1f}%) · held "
                      f"{dur(t['held_hours'])} · closed {uae(t['exit_time'])}"
                      + (f" · why: {', '.join(TAG_WORDS.get(x, x) for x in t['loss_tags'][:2])}" if t.get("loss_tags") else ""))
     L.append("")
@@ -932,6 +1346,10 @@ def main(argv=None) -> int:
     ap.add_argument("--starting-balance", type=float, help="set the practice account's starting balance (USD), "
                     "counted from the first practice trade unless --account-start is given")
     ap.add_argument("--account-start", help="ISO time the account starts (default: first practice trade)")
+    ap.add_argument("--enable-protection", action="store_true",
+                    help="switch on account protection (daily/weekly loss limits, profit lock, max 6 open) and "
+                         "let-winners-run (break-even at +1R, half at target, ATR trail) for this ledger")
+    ap.add_argument("--daily-goal", type=float, help="with --enable-protection: daily goal for the profit lock (USD)")
     ap.add_argument("--allow-no-dedupe", action="store_true", help="open trades even if the scan used --no-state (tests)")
     a = ap.parse_args(argv)
     led = Ledger(a.ledger)
@@ -939,6 +1357,14 @@ def main(argv=None) -> int:
         led.lock()
         try:
             print(json.dumps(set_starting_balance(led, a.starting_balance, a.account_start), indent=2, default=str))
+        finally:
+            led.unlock()
+        if not (a.run or a.seed_from_state or a.summary or a.enable_protection):
+            return 0
+    if a.enable_protection or a.daily_goal is not None:
+        led.lock()
+        try:
+            print(json.dumps(enable_protection(led, a.daily_goal), indent=2, default=str))
         finally:
             led.unlock()
         if not (a.run or a.seed_from_state or a.summary):
