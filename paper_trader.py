@@ -84,6 +84,30 @@ with --enable-sessions). They only decide whether a PRACTICE TRADE opens; signal
   ($500 collateral); never despite the weekly limit or the quiet-hours cap. Session rules, the
   NY-open-candle skip and the free-cash check still apply. Tagged override = {...}.
 
+ENTRY FILTERS (trades.json rules.entry_filters; switched on with --enable-filters, ledgers without it
+behave exactly as before):
+  - LIVE: the bigger chart must agree (features.higher_tf_agrees, the same check quiet hours use) for
+    EVERY new trade, every style and session; the 75%+ exception never bypasses it. Blocked signals
+    get reason "bigger chart disagrees".
+  - SHADOW (log only - never blocks or resizes a trade): "would be half size: Swing probation" on
+    Swing entries until Swing has >= 5 closed trades with positive total P&L; "would skip: stretched
+    RSI" on stretched-RSI entries below 75% confidence. Tags go on the trade (shadow / shadow_tags)
+    and, for signals that did not open, on skipped_signals.jsonl in the ledger folder.
+  - Tracking on new trades: BTC trend at entry (1h and 4h EMA21 vs EMA50), session, max favourable /
+    adverse excursion (mfe_usd / mae_usd / mfe_r / mae_r). Closed trades with |P&L| < $1 count as
+    "scratch" (not a win or a loss); win rate = wins / (wins + losses).
+
+  - CLEANUP (23 Oct 2026, same switch): ONE minimum confidence of 55% for every style and session
+    (rules.sessions keeps the old 55/65/70 values, overlaid at run time); the 15m slow-hours windows and
+    the NY-open-candle skip are frozen (code kept); the 75%+ exception keeps its full-size override of
+    the profit lock / 6-trade cap / prime slots but no longer opens a half-size trade during a daily-loss
+    pause (daily loss limit is absolute). Learning filter frozen (records stats and what it would have
+    done, never blocks or adds penalties) until 100 closed trades. No new real Scalp-1h trades (merged
+    into Day) or Swing trades (shadow mode); open ones run on unchanged. Signals that do not open become
+    hypothetical shadow trades (shadow_trades.json: plain stop / target / time limit, same costs).
+    Shadow log per signal: relative volume, funding, OKX open interest (if reachable), BTC 1h/4h trend,
+    stretched RSI, session. thin_backtest_edge is no longer an entry / loss tag.
+
 Usage:
   python paper_trader.py --run [--scan last_run.json] [--ledger DIR]     (used by run.sh)
   python paper_trader.py --summary [--ledger DIR]
@@ -155,6 +179,21 @@ DEFAULT_SESSIONS = dict(
     prime_reserved_slots=2, ny_candle_skip_tfs=["15m", "30m"])
 DEFAULT_OVERRIDE = dict(override_min_confidence=75, full_size=["profit_lock", "max_open", "prime_reserved"],
                         half_size=["daily_loss"], half_size_per_day=1, half_size_frac=0.5)
+DEFAULT_FILTERS = dict(
+    higher_tf_everywhere=True, scratch_usd=1.0,
+    shadow=dict(swing_probation=dict(min_closed=5), stretched_rsi=dict(max_confidence=75)),
+    # cleanup approved 23 Oct 2026
+    single_min_conf=55,                 # one minimum for every style and session (replaces 55/65/70)
+    freeze_scalp15_windows=True,        # 15m slow-hours 65% rule frozen (code kept)
+    freeze_ny_candle_skip=True,         # NY-open-candle skip frozen (code kept)
+    exception_half_size=False,          # no half-size 75%+ trade during a daily-loss pause (limit is absolute)
+    learning_freeze_until=100,          # learning records only (no new penalties/blocks, not enforced) until N closed
+    shadow_styles={"Scalp-1h": "Scalp-1h merged into Day (shadow only)", "Swing": "Swing in shadow mode"},
+    shadow_trades=True, shadow_max_open=40, open_interest=True)
+SHADOW_FILE = "shadow_trades.json"
+SCRATCH_USD = 1.0
+HTF_REASON = "bigger chart disagrees"
+SKIP_LOG = "skipped_signals.jsonl"
 PAUSE_ORDER = ["weekly", "daily_loss", "profit_lock", "max_open", "prime_reserved", "quiet_cap"]
 
 REASON_TEXT = {
@@ -176,7 +215,7 @@ TAG_WORDS = {
     "timeout_loss": "went nowhere and timed out at a loss",
 }
 ENTRY_TAGS = ["low_adx", "against_higher_tf", "weak_confluence", "high_volatility",
-              "adverse_funding", "stretched_rsi", "thin_backtest_edge"]
+              "adverse_funding", "stretched_rsi"]            # thin_backtest_edge dropped 23 Oct 2026
 
 
 # ---------------------------------------------------------------- small helpers
@@ -508,6 +547,17 @@ def walk_trade(t: dict, df: pd.DataFrame, now: datetime, atr_lookup=None, events
             exit_px, reason = target, "target"
         elif ct >= deadline:
             exit_px, reason = c, ("timeout_runner" if m and m["partial_done"] else "timeout")
+        ex = t.get("excursion")
+        if ex is not None:                    # max favourable / adverse price while open
+            hi, lo = h, l
+            if reason in ("stop", "liq", "breakeven", "trail"):
+                hi, lo = (hi, max(lo, exit_px)) if d == 1 else (min(hi, exit_px), lo)
+            elif reason == "target":
+                hi, lo = (min(hi, target), lo) if d == 1 else (hi, max(lo, target))
+            fav, adv = (hi, lo) if d == 1 else (lo, hi)
+            pick_f, pick_a = (max, min) if d == 1 else (min, max)
+            ex["best"] = fav if ex.get("best") is None else pick_f(ex["best"], fav)
+            ex["worst"] = adv if ex.get("worst") is None else pick_a(ex["worst"], adv)
         t["last_checked"] = ct.isoformat()
         t["last_price"] = c
         if reason:
@@ -594,6 +644,7 @@ def compute_features(sig: dict, fetcher=None) -> dict:
             timeframes=len(mtf["tfs"]),
             higher_tf=mtf["higher"],
             higher_tf_agrees=bool(mtf["tfs"].get(mtf["higher"], {}).get("st_dir") == d),
+            rel_volume=r2(last["vol_ratio"], 2) if pd.notna(last.get("vol_ratio")) else None,
         )
     except Exception as e:
         f["feature_error"] = str(e)[:120]
@@ -616,21 +667,175 @@ def entry_tags(f: dict) -> list[str]:
         tags.append("adverse_funding")
     if f.get("rsi") is not None and ((d == 1 and f["rsi"] >= 70) or (d == -1 and f["rsi"] <= 30)):
         tags.append("stretched_rsi")
-    er, n = f.get("backtest_exp_r"), f.get("backtest_trades") or 0
-    if er is None or er < 0.1 or n < 10:
-        tags.append("thin_backtest_edge")
     return tags
 
 
 def postmortem_tags(t: dict) -> list[str]:
     if t["pnl_usd"] > 0:
         return []
-    tags = list(t.get("entry_tags", []))
+    tags = [x for x in t.get("entry_tags", []) if x != "thin_backtest_edge"]
     if t["reason"] in ("stop", "liq", "breakeven") and t["held_hours"] < 0.25 * t["max_hold_hours"]:
         tags.insert(0, "quick_stop")
     if t["reason"] in ("timeout", "timeout_runner"):
         tags.insert(0, "timeout_loss")
     return tags
+
+
+def outcome(t: dict, scratch: float = SCRATCH_USD) -> str:
+    """win / loss / scratch (|P&L| below $1 = break-even exit, counted as neither)."""
+    p = float(t.get("pnl_usd") or 0)
+    return "scratch" if abs(p) < scratch else ("win" if p > 0 else "loss")
+
+
+def wls(trades: list[dict]) -> dict:
+    o = [outcome(t) for t in trades]
+    w, l, s = o.count("win"), o.count("loss"), o.count("scratch")
+    return dict(n=len(trades), wins=w, losses=l, scratches=s,
+                win_rate_pct=r2(w / (w + l) * 100, 1) if (w + l) else None,
+                pnl_usd=r2(sum(t.get("pnl_usd") or 0 for t in trades)))
+
+
+def btc_trend(fetcher=None) -> dict:
+    """BTC trend now: per timeframe 'up' (EMA21 > EMA50 and price > EMA50), 'down' (both below) or 'mixed'."""
+    out = {}
+    for tf in ("1h", "4h"):
+        try:
+            df = (fetcher or _klines_fetcher)("BTCUSDT", tf, 150)[0]
+            if df is None or len(df) < 60:
+                out[tf] = None
+                continue
+            c = df["close"].astype(float)
+            e21, e50, px = float(app.ema(c, 21).iloc[-1]), float(app.ema(c, 50).iloc[-1]), float(c.iloc[-1])
+            out[tf] = "up" if (e21 > e50 and px > e50) else ("down" if (e21 < e50 and px < e50) else "mixed")
+            if tf == "1h":
+                out["price"] = px
+        except Exception:
+            out[tf] = None
+    return out
+
+
+def get_filter_cfg(trades_doc) -> dict | None:
+    f = get_rules(trades_doc).get("entry_filters")
+    return dict(DEFAULT_FILTERS, **f) if f else None
+
+
+def shadow_tags(sig: dict, tags: list[str], feats: dict, trades_doc: dict, cfg: dict | None) -> list[dict]:
+    """Log-only filters being tested. Never change whether or how big a trade is."""
+    if not cfg:
+        return []
+    sh = dict(DEFAULT_FILTERS["shadow"], **(cfg.get("shadow") or {}))
+    out = []
+    if sig["style"] == "Swing" and sh.get("swing_probation") is not None:
+        sw = [t for t in trades_doc["trades"] if t["status"] == "closed" and t["style"] == "Swing"]
+        n, pnl = len(sw), sum(t["pnl_usd"] for t in sw)
+        if n < int(sh["swing_probation"].get("min_closed", 5)) or pnl <= 0:
+            out.append(dict(filter="swing_probation", action="half_size", text="would be half size: Swing probation",
+                            detail=f"Swing so far: {n} closed, ${pnl:+.2f}"))
+    conf = sig.get("confidence") or 0
+    if sh.get("stretched_rsi") is not None and "stretched_rsi" in tags \
+            and conf < float(sh["stretched_rsi"].get("max_confidence", 75)):
+        out.append(dict(filter="stretched_rsi", action="skip", text="would skip: stretched RSI",
+                        detail=f"RSI {feats.get('rsi')}, confidence {conf}%"))
+    return out
+
+
+def tag_new_trade(t: dict, sig: dict, tags: list[str], feats: dict, trades_doc: dict, cfg, btc) -> None:
+    """Shadow tags, BTC trend, session and excursion tracking on a NEW trade (filters switched on)."""
+    if not cfg:
+        return
+    sh = shadow_tags(sig, tags, feats, trades_doc, cfg)
+    t["shadow"] = sh
+    t["shadow_tags"] = [x["text"] for x in sh]
+    t["btc_trend"] = btc
+    t["features"]["btc_trend"] = btc
+    if t.get("session"):
+        t["features"]["session"] = t["session"]
+    t["excursion"] = dict(best=None, worst=None)
+
+
+def fetch_open_interest(pair: str) -> dict | None:
+    """Open interest from OKX's public API (perpetual swap). None if not reachable."""
+    try:
+        import requests
+        base, quote = app.parse_pair(pair)
+        r = requests.get("https://www.okx.com/api/v5/public/open-interest",
+                         params=dict(instType="SWAP", instId=f"{base}-{quote}-SWAP"), timeout=4)
+        d = (r.json().get("data") or [None])[0]
+        if not d:
+            return None
+        return dict(oi_ccy=r2(float(d["oiCcy"]), 4), oi_usd=r2(float(d.get("oiUsd") or 0), 0), source="OKX")
+    except Exception:
+        return None
+
+
+class ShadowBook:
+    """Hypothetical trades for signals that did NOT open (blocked, or a style in shadow mode).
+    Plain rules: the signal's stop / target / the style's time limit (no break-even, half or trail),
+    same costs as a real paper trade. Stored in shadow_trades.json; never affects real trades."""
+
+    def __init__(self, ledger: "Ledger"):
+        self.path = ledger.root / SHADOW_FILE
+        self.ledger = ledger
+        self.doc = ledger._read(self.path, {"version": 1, "trades": []})
+        self.doc.setdefault("trades", [])
+
+    def opens(self):
+        return [t for t in self.doc["trades"] if t["status"] == "open"]
+
+    def add(self, s2, feats, tags, fr, now, stage, reason, shadow, session, max_open=40):
+        if any(t["pair"] == s2["pair"] and t["style"] == s2["style"] and t["side"] == s2["side"] for t in self.opens()):
+            return None
+        if len(self.opens()) >= max_open:
+            return None
+        try:
+            t = open_trade(s2, now, feats, tags, funding=fr)
+        except Exception:
+            return None
+        t["id"] = "shadow-" + t["id"]
+        t.update(shadow_stage=stage, shadow_reason=reason, shadow=shadow, shadow_tags=[x["text"] for x in shadow],
+                 session=session, excursion=dict(best=None, worst=None))
+        self.doc["trades"].append(t)
+        return t
+
+    def update(self, now, candle_loader=None):
+        ops = self.opens()
+        if not ops:
+            return []
+        from concurrent.futures import ThreadPoolExecutor
+        def load(t):
+            since = parse_t(t["last_checked"]) if t.get("last_checked") else parse_t(t["opened_at"])
+            try:
+                return load_fine_candles(t["pair"], since, now, loader=candle_loader)
+            except Exception:
+                return None, None, None, "error"
+        with ThreadPoolExecutor(max_workers=min(6, len(ops))) as ex:
+            data = list(ex.map(load, ops))
+        closed = []
+        for t, (df, tf, src, warn) in zip(ops, data):
+            res = walk_trade(t, df, now)
+            if res:
+                t.update(res, status="closed")
+                t["outcome"] = outcome(t)
+                t.update(excursion_fields(t))
+                closed.append(t)
+        return closed
+
+    def save(self):
+        cut = utcnow() - timedelta(days=60)
+        self.doc["trades"] = [t for t in self.doc["trades"]
+                              if t["status"] == "open" or parse_t(t.get("exit_time") or t["opened_at"]) > cut]
+        self.ledger._write(self.path, self.doc)
+
+
+def excursion_fields(t: dict) -> dict:
+    ex = t.get("excursion") or {}
+    if ex.get("best") is None or not t.get("entry_fill"):
+        return {}
+    d, ef, nt, risk = t["dir"], t["entry_fill"], t["notional"], t.get("planned_risk_usd") or 0
+    mfe = max(d * (ex["best"] - ef) / ef * nt, 0.0)
+    mae = min(d * (ex["worst"] - ef) / ef * nt, 0.0)
+    return dict(mfe_usd=r2(mfe), mae_usd=r2(mae), mfe_r=r2(mfe / risk) if risk else None,
+                mae_r=r2(mae / risk) if risk else None)
 
 
 # ---------------------------------------------------------------- learning
@@ -678,9 +883,18 @@ def _log_change(learning, now, key, change, reason, stats, out_changes):
     out_changes.append(e)
 
 
+def learning_frozen(trades_doc: dict) -> bool:
+    f = get_filter_cfg(trades_doc)
+    n = sum(t["status"] == "closed" for t in trades_doc["trades"])
+    return bool(f and f.get("learning_freeze_until") and n < int(f["learning_freeze_until"]))
+
+
 def learn(trades_doc: dict, learning: dict, now: datetime) -> list[dict]:
-    """Recompute every bucket from closed trades; apply bounded changes. Returns changes made."""
+    """Recompute every bucket from closed trades; apply bounded changes. Returns changes made.
+    While frozen (entry filters, < 100 closed) only the stats are recorded - no new penalties or blocks."""
     closed = sorted([t for t in trades_doc["trades"] if t["status"] == "closed"], key=lambda t: t["exit_time"])
+    frozen = learning_frozen(trades_doc)
+    learning["frozen"] = frozen
     groups: dict[str, list] = {}
     for t in closed:
         for k in buckets_for(t["pair"], t["style"], t["side"], t.get("entry_tags", [])):
@@ -698,6 +912,8 @@ def learn(trades_doc: dict, learning: dict, now: datetime) -> list[dict]:
             b["blocked"], b["blocked_until"], b["block_started"] = False, None, None
             _log_change(learning, now, k, "unblocked (14-day re-test)",
                         f"block period ended; trading again at +{b['penalty']} confidence", s, changes)
+        if frozen:
+            continue                                      # recording only
         if len(tr) == b.get("evaluated_n", 0):
             continue                                      # nothing new to learn
         b["evaluated_n"] = len(tr)
@@ -776,7 +992,8 @@ def lessons(learning: dict, trades_doc: dict) -> list[str]:
         cnt = {}
         for t in losses:
             for tg in t.get("loss_tags", []):
-                cnt[tg] = cnt.get(tg, 0) + 1
+                if tg in ENTRY_TAGS or tg in ("quick_stop", "timeout_loss"):
+                    cnt[tg] = cnt.get(tg, 0) + 1
         for tg, c in sorted(cnt.items(), key=lambda kv: -kv[1])[:4]:
             L.append(f"{c} of {len(losses)} losses had: {TAG_WORDS.get(tg, tg)}.")
     return L
@@ -828,7 +1045,9 @@ def closed_view(t):
                 half_closed_at_target=bool(t.get("partials")),
                 booked_at_target_usd=r2(booked_partial_usd(t)) if t.get("partials") else None,
                 final_part_pnl_usd=r2(t.get("final_part_pnl_usd")) if t.get("partials") else None,
-                initial_stop=(t.get("mgmt") or {}).get("initial_stop", t.get("stop")))
+                initial_stop=(t.get("mgmt") or {}).get("initial_stop", t.get("stop")),
+                outcome=outcome(t), shadow_tags=t.get("shadow_tags"), btc_trend=t.get("btc_trend"),
+                **excursion_fields(t))
 
 
 def opened_view(t):
@@ -839,7 +1058,8 @@ def opened_view(t):
                 closes_by_uae=uae(t["deadline"]), entry_tags=t["entry_tags"], probe=t["probe"], note=t["note"],
                 session=t.get("session"), override=t.get("override"),
                 override_note=(t.get("override") or {}).get("note"),
-                size="half" if t["collateral"] < COLLATERAL - 1e-9 else "full")
+                size="half" if t["collateral"] < COLLATERAL - 1e-9 else "full",
+                shadow_tags=t.get("shadow_tags"), btc_trend=t.get("btc_trend"))
 
 
 def open_view(t, now):
@@ -1056,14 +1276,38 @@ def prime_window(day: date, cfg: dict):
     return nyo - timedelta(minutes=cfg["prime_before_min"]), nyo + timedelta(minutes=cfg["prime_after_min"]), nyo
 
 
+def _session_overlay(c: dict, f: dict | None) -> dict:
+    """Entry-filter cleanup on top of the stored session rules (stored rules untouched)."""
+    if not f:
+        return c
+    c = dict(c)
+    if f.get("single_min_conf") is not None:
+        c.update(single_min_conf=f["single_min_conf"], prime_conf=f["single_min_conf"],
+                 normal_conf=f["single_min_conf"], quiet_conf=f["single_min_conf"],
+                 scalp15_strict_conf=f["single_min_conf"])
+    if f.get("higher_tf_everywhere"):
+        c["quiet_need_higher_tf"] = False          # covered by the every-trade rule
+    if f.get("freeze_scalp15_windows"):
+        c["scalp15_strict_windows"] = []
+    if f.get("freeze_ny_candle_skip"):
+        c["ny_candle_skip_tfs"] = []
+    return c
+
+
 def get_session_cfg(trades_doc) -> dict | None:
     c = get_rules(trades_doc).get("sessions")
-    return dict(DEFAULT_SESSIONS, **c) if c else None
+    return _session_overlay(dict(DEFAULT_SESSIONS, **c), get_filter_cfg(trades_doc)) if c else None
 
 
 def get_override_cfg(trades_doc) -> dict | None:
     c = get_rules(trades_doc).get("high_conf_override")
-    return dict(DEFAULT_OVERRIDE, **c) if c else None
+    if not c:
+        return None
+    c = dict(DEFAULT_OVERRIDE, **c)
+    f = get_filter_cfg(trades_doc)
+    if f and not f.get("exception_half_size", True):
+        c["half_size"] = []                       # daily loss limit is absolute
+    return c
 
 
 def session_at(now: datetime, cfg: dict) -> dict:
@@ -1097,6 +1341,8 @@ def next_prime(now: datetime, cfg: dict):
 
 def session_min_conf(style: str, sess: dict, now: datetime, cfg: dict):
     """(minimum confidence, needs higher-timeframe agreement, label) for this style now."""
+    if cfg.get("single_min_conf") is not None:
+        return cfg["single_min_conf"], bool(sess["name"] == "quiet" and cfg["quiet_need_higher_tf"]), "minimum"
     if sess["name"] == "prime":
         return cfg["prime_conf"], False, "NY prime"
     if sess["name"] == "quiet":
@@ -1132,11 +1378,12 @@ def session_state(trades_doc, now) -> dict | None:
     prot_cfg = dict(DEFAULT_PROTECTION, **(get_rules(trades_doc).get("protection") or {}))
     cap = int(prot_cfg["max_open"])
     th = {}
+    htf_all = bool((get_filter_cfg(trades_doc) or {}).get("higher_tf_everywhere"))
     for st in app.STYLES:
         if st == "Scalp":
             continue
         c, htf, lab = session_min_conf(st, sess, now, cfg)
-        th[st] = dict(min_confidence=c, needs_higher_tf_agreement=htf, rule=lab)
+        th[st] = dict(min_confidence=c, needs_higher_tf_agreement=htf or htf_all, rule=lab)
     np_ = next_prime(now, cfg)
     hm = lambda x: f"{x.astimezone(app.LOCAL_TZ):%H:%M}"
     out = dict(
@@ -1155,6 +1402,8 @@ def session_state(trades_doc, now) -> dict | None:
                              text=f"{np_[0].astimezone(app.LOCAL_TZ):%a %d %b} {hm(np_[0])}-{hm(np_[1])} UAE")
                         if np_ else None),
         in_prime_now=sess["name"] == "prime",
+        frozen=[x for x, on in (("15m slow-hours 65% windows", cfg.get("scalp15_strict_windows") == []),
+                                ("NY-open-candle skip", cfg.get("ny_candle_skip_tfs") == [])) if on],
         higher_tf_field="features.higher_tf_agrees (Supertrend direction on the style's highest chart: "
                         "4h for Day/Scalp-15m/Scalp-30m, 1d for Scalp-1h, 1w for Swing)")
     oc = get_override_cfg(trades_doc)
@@ -1164,7 +1413,9 @@ def session_state(trades_doc, now) -> dict | None:
         out["high_conf_override"] = dict(min_confidence=oc["override_min_confidence"], full_size_despite=oc["full_size"],
                                          half_size_despite=oc["half_size"],
                                          half_size_left_today=max(int(oc["half_size_per_day"]) - used, 0),
-                                         never_despite=["weekly", "quiet_cap"])
+                                         never_despite=["weekly", "quiet_cap"]
+                                         + ([] if oc["half_size"] else ["daily_loss"])
+                                         + (["bigger chart disagrees"] if htf_all else []))
     return out
 
 
@@ -1182,6 +1433,7 @@ def gate_new_trade(trades_doc: dict, sig: dict, feats: dict, now: datetime) -> d
     conf = sig.get("confidence") or 0
     scfg, ocfg = get_session_cfg(trades_doc), get_override_cfg(trades_doc)
     sess = session_at(now, scfg) if scfg else None
+    htf_all = bool((get_filter_cfg(trades_doc) or {}).get("higher_tf_everywhere"))
     res = dict(allowed=False, collateral=COLLATERAL, session=sess["name"] if sess else None, override=None,
                reason=None, why=None, all_reasons=[], extra={})
 
@@ -1228,11 +1480,18 @@ def gate_new_trade(trades_doc: dict, sig: dict, feats: dict, now: datetime) -> d
         if conf < need:
             r = f"{lab} need {need}%+"
             return block(r, f"{r}: this signal is {conf}%", required_confidence=need)
-        if need_htf and feats.get("higher_tf_agrees") is not True:
+        if need_htf and not htf_all and feats.get("higher_tf_agrees") is not True:
             hi = feats.get("higher_tf") or "higher chart"
             return block("quiet hours need higher-timeframe agreement",
                          f"quiet hours need higher-timeframe agreement: the {hi} Supertrend "
                          f"{'does not agree' if feats.get('higher_tf_agrees') is False else 'is unknown'}")
+
+    # bigger chart must agree on every trade (entry filter; never overridden, not even at 75%+)
+    if htf_all and feats.get("higher_tf_agrees") is not True:
+        hi = feats.get("higher_tf") or "higher chart"
+        return block(HTF_REASON, f"{HTF_REASON}: the {hi} Supertrend "
+                                 f"{'points the other way' if feats.get('higher_tf_agrees') is False else 'is unknown (no data)'}",
+                     higher_tf=feats.get("higher_tf"), higher_tf_agrees=feats.get("higher_tf_agrees"))
 
     # high-confidence exception (>= override_min_confidence)
     if pauses:
@@ -1288,6 +1547,32 @@ def enable_sessions(ledger: "Ledger", now=None, override_min_confidence: float |
     return dict(rules=rules, trades_tagged=tagged)
 
 
+def enable_filters(ledger: "Ledger", now=None) -> dict:
+    """Switch on entry filters (bigger chart everywhere + shadow filters + extra tracking); trades.json backed up first.
+    Existing (open or closed) trades are not changed."""
+    now = now or utcnow()
+    trades_doc, _ = ledger.load()
+    rules = trades_doc.setdefault("rules", {})
+    f = dict(DEFAULT_FILTERS, **(rules.get("entry_filters") or {}))
+    f.setdefault("enabled_at", now.isoformat())
+    rules["entry_filters"] = f
+    rules["updated_at"] = now.isoformat()
+    ledger._write(ledger.trades_path, trades_doc)
+    return dict(entry_filters=f)
+
+
+def read_skip_log(ledger: "Ledger") -> list[dict]:
+    p = ledger.root / SKIP_LOG
+    out = []
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+    return out
+
+
 def set_starting_balance(ledger: "Ledger", amount: float, start_time: str | None = None) -> dict:
     """Store the practice account in trades.json (backed up first). Start = first practice trade if not given.
     Trades, processed signals and learning are not touched."""
@@ -1304,10 +1589,12 @@ def set_starting_balance(ledger: "Ledger", amount: float, start_time: str | None
 def totals(trades_doc, now):
     closed = [t for t in trades_doc["trades"] if t["status"] == "closed"]
     opens = [t for t in trades_doc["trades"] if t["status"] == "open"]
-    wins = sum(t["pnl_usd"] > 0 for t in closed)
+    s = wls(closed)
     unr = [unrealised(t, now) for t in opens]
-    return dict(closed_trades=len(closed), wins=wins, losses=len(closed) - wins,
-                win_rate_pct=r2(wins / len(closed) * 100, 1) if closed else None,
+    return dict(closed_trades=len(closed), wins=s["wins"], losses=s["losses"], scratches=s["scratches"],
+                win_rate_pct=s["win_rate_pct"],
+                win_rate_incl_scratches_pct=r2(s["wins"] / len(closed) * 100, 1) if closed else None,
+                win_rate_note=f"scratch = closed with |P&L| < ${SCRATCH_USD:g} (break-even); win rate = wins / (wins + losses)",
                 total_pnl_usd=r2(sum(t["pnl_usd"] for t in closed)),
                 avg_r=r2(sum(t["r_multiple"] for t in closed) / len(closed)) if closed else None,
                 open_trades=len(opens),
@@ -1342,6 +1629,8 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
         if res:
             t.update(res, status="closed")
             t["loss_tags"] = postmortem_tags(t)
+            t["outcome"] = outcome(t)
+            t.update(excursion_fields(t))
             out["closed"].append(closed_view(t))
     out["partial_closes"] = [e for e in events if e["kind"] == "partial"]
     out["stop_moves"] = [e for e in events if e["kind"] == "stop_move"]
@@ -1350,6 +1639,38 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
     changes = learn(trades_doc, learning, now)
 
     # 3. new signals
+    fcfg = get_filter_cfg(trades_doc)
+    frozen = learning_frozen(trades_doc)
+    sbook = ShadowBook(ledger) if (fcfg and fcfg.get("shadow_trades")) else None
+    shadow_closed = sbook.update(now, candle_loader) if sbook else []
+    skip_log = []
+    _btc = {}
+
+    def btc():                                      # BTC trend, fetched once per run when first needed
+        if "v" not in _btc:
+            _btc["v"] = btc_trend(feature_fetcher)
+        return _btc["v"]
+
+    def log_skip(sig, s2, feats, tags, stage, reason, why=None, session=None, fr=None):
+        if not fcfg:
+            return
+        sh = shadow_tags(s2, tags, feats, trades_doc, fcfg)
+        if session is None and get_session_cfg(trades_doc):
+            session = session_at(now, get_session_cfg(trades_doc))["name"]
+        st = None
+        if sbook is not None and s2.get("entry") and s2.get("stop") and s2.get("target"):
+            st = sbook.add(s2, feats, tags, fr or (s2.get("funding_rate_8h") or 0.0001, "scan", False), now, stage,
+                           reason, sh, session, int(fcfg.get("shadow_max_open", 40)))
+            if st is not None:
+                st["btc_trend"] = btc()
+        skip_log.append(dict(shadow_trade_id=st["id"] if st else None, rel_volume=feats.get("rel_volume"),
+                             funding_rate_8h=s2.get("funding_rate_8h"), open_interest=feats.get("open_interest"),
+                             rsi=feats.get("rsi"), stretched_rsi="stretched_rsi" in tags, time_utc=now.isoformat(), time_uae=uae(now), pair=sig["pair"], style=sig["style"],
+                             side=sig["side"], entry_tf=sig.get("timeframe"), confidence=sig.get("confidence"),
+                             entry=sig.get("entry"), stop=sig.get("stop"), target=sig.get("target"),
+                             stage=stage, reason=reason, why=why or reason, session=session,
+                             higher_tf=feats.get("higher_tf"), higher_tf_agrees=feats.get("higher_tf_agrees"),
+                             entry_tags=tags, shadow=sh, shadow_tags=[x["text"] for x in sh], btc_trend=btc()))
     skipped, probes = [], []
     passed = []
     sigs = (scan or {}).get("new_signals_before_learning", (scan or {}).get("new_signals", [])) or []
@@ -1361,6 +1682,8 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
         fr = funding_fn(sig["pair"])
         s2["funding_rate_8h"], s2["funding_source"] = fr[0], fr[1]
         feats = compute_features(s2, fetcher=feature_fetcher)
+        if fcfg and fcfg.get("open_interest") and feature_fetcher is None:
+            feats["open_interest"] = fetch_open_interest(sig["pair"])
         return s2, fr, feats
     todo = [s for s in sigs if f"{s['pair']}|{s['style']}|{s['side']}|{run_key}" not in trades_doc["processed_signals"]]
     prepped = {}
@@ -1381,13 +1704,18 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
             continue
         s2, fr, feats = prepped.get(id(sig)) or prep(sig)
         tags = entry_tags(feats)
-        verdict = judge_signal(s2, tags, learning)
+        verdict = judge_signal(s2, tags, learning, dry=frozen)
+        if frozen:                                  # learning frozen: record what it would have done, never block
+            feats["learning_would"] = (verdict["reason"] if not verdict["allowed"] or verdict["probe"]
+                                       else f"pass (needs {verdict['required_confidence']}%)")
+            verdict = dict(verdict, allowed=True, probe=False, reason=None)
         rec = dict(time=now.isoformat(), passed=verdict["allowed"], reason=verdict["reason"])
         if not verdict["allowed"]:
             skipped.append(dict(pair=sig["pair"], style=sig["style"], entry_tf=sig.get("timeframe"),
                                 side=sig["side"], confidence=sig.get("confidence"),
                                 required_confidence=verdict["required_confidence"], reason=verdict["reason"]))
             trades_doc["processed_signals"][pkey] = rec
+            log_skip(sig, s2, feats, tags, "learning", verdict["reason"])
             continue
         passed.append(sig)
         if verdict["probe"]:
@@ -1402,6 +1730,13 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
             out["not_opened"].append(dict(pair=sig["pair"], style=sig["style"], side=sig["side"],
                                           why="a paper trade for this pair + style is already open"))
             continue
+        sty_why = (fcfg or {}).get("shadow_styles", {}).get(sig["style"])
+        if sty_why:                                 # style in shadow mode: no real trade, hypothetical one instead
+            out["not_opened"].append(dict(pair=sig["pair"], style=sig["style"], side=sig["side"],
+                                          confidence=sig.get("confidence"), entry_tf=sig.get("timeframe"),
+                                          why=sty_why, reason=sty_why, shadow_only=True))
+            log_skip(sig, s2, feats, tags, "style_shadow", sty_why, fr=fr)
+            continue
         g = gate_new_trade(trades_doc, s2, feats, now)
         if not g["allowed"]:
             item = dict(pair=sig["pair"], style=sig["style"], side=sig["side"],
@@ -1411,7 +1746,10 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
                 item["all_reasons"] = g["all_reasons"]
             if g["session"]:
                 item["session"] = g["session"]
+            if fcfg:
+                item["shadow_tags"] = [x["text"] for x in shadow_tags(s2, tags, feats, trades_doc, fcfg)]
             out["not_opened"].append(item)
+            log_skip(sig, s2, feats, tags, "gate", g["reason"], g["why"], g["session"], fr)
             continue
         t = open_trade(s2, now, feats, tags, probe=verdict["probe"], funding=fr,
                        required=verdict["required_confidence"], collateral=g["collateral"])
@@ -1421,6 +1759,7 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
         if g["override"]:
             t["override"] = g["override"]
             t["note"] = (t["note"] + " " if t["note"] else "") + g["override"]["note"]
+        tag_new_trade(t, s2, tags, feats, trades_doc, fcfg, btc() if fcfg else None)
         if runners:
             init_mgmt(t, now, runners)
         trades_doc["trades"].append(t)
@@ -1436,6 +1775,18 @@ def run(ledger: Ledger, scan: dict | None, now: datetime | None = None, candle_l
     out["protection"] = prot
     out["session"] = session_state(trades_doc, now)
     ledger.save(trades_doc, learning)
+    if sbook is not None:
+        sbook.save()
+        out["shadow"] = dict(open=len(sbook.opens()), opened=[t["id"] for t in sbook.opens()
+                                                               if t["opened_at"] == now.isoformat()],
+                             closed=[dict(id=t["id"], pair=t["pair"], style=t["style"], side=t["side"],
+                                          stage=t.get("shadow_stage"), reason=t.get("shadow_reason"),
+                                          exit_reason=t["reason"], pnl_usd=r2(t["pnl_usd"]), outcome=t["outcome"])
+                                     for t in shadow_closed])
+    if skip_log:
+        with open(ledger.root / SKIP_LOG, "a", encoding="utf-8") as fh:
+            for r in skip_log:
+                fh.write(json.dumps(r, default=str) + "\n")
     if changes:
         with open(ledger.changes_txt, "a", encoding="utf-8") as fh:
             for c in changes:
@@ -1526,6 +1877,8 @@ def seed_from_state(ledger: Ledger, state_path: Path, now=None, day_uae: str | N
             t["session"] = g["session"]
         if g["override"]:
             t["override"] = g["override"]
+        fc = get_filter_cfg(trades_doc)
+        tag_new_trade(t, sig, tags, feats, trades_doc, fc, btc_trend() if fc else None)
         if get_rules(trades_doc).get("let_winners_run"):
             init_mgmt(t, now, get_rules(trades_doc)["let_winners_run"])
         trades_doc["trades"].append(t)
@@ -1576,15 +1929,88 @@ def session_lines(ss: dict) -> list[str]:
              + (" (2 slots kept for NY prime)" if not ss["in_prime_now"] else "")
              + f" · quiet-hours trades open {ss['quiet_opened_open_trades']} of max {ss['quiet_max_open']}")
     if ss.get("prime_today_uae"):
-        L.append(f"  Today: NY open {ss['ny_open_uae']}, prime {ss['prime_today_uae']} UAE, "
-                 f"NY-open candle skipped {ss['ny_open_candle_skip_uae']}")
+        L.append(f"  Today: NY open {ss['ny_open_uae']}, prime {ss['prime_today_uae']} UAE"
+                 + ("" if "NY-open-candle skip" in (ss.get("frozen") or [])
+                    else f", NY-open candle skipped {ss['ny_open_candle_skip_uae']}"))
     if ss.get("next_prime_uae"):
         L.append(f"  {'Prime now, until' if ss['in_prime_now'] else 'Next prime'}: {ss['next_prime_uae']['text']}")
     o = ss.get("high_conf_override")
     if o:
-        L.append(f"  {o['min_confidence']}%+ exception: full size despite profit lock / 6-trade cap / prime slots; half size despite "
-                 f"the daily loss limit ({o['half_size_left_today']} left today); never despite the weekly limit "
-                 f"or quiet-hours cap")
+        half = (f"; half size despite the daily loss limit ({o['half_size_left_today']} left today)"
+                if o["half_size_despite"] else "")
+        nev = ["the weekly limit"] + (["the daily loss limit"] if "daily_loss" in o["never_despite"] else []) \
+            + ["the quiet-hours cap"] + (["the bigger-chart rule"] if HTF_REASON in o["never_despite"] else [])
+        L.append(f"  {o['min_confidence']:g}%+ exception: full size despite profit lock / 6-trade cap / prime slots{half}; "
+                 f"never despite {', '.join(nev[:-1])} or {nev[-1]}")
+        if ss.get("frozen"):
+            L.append("  Frozen (code kept, not applied): " + "; ".join(ss["frozen"]))
+    return L
+
+
+def _wls_text(s: dict) -> str:
+    if not s["n"]:
+        return "none yet"
+    wr = f"{s['win_rate_pct']:.0f}%" if s["win_rate_pct"] is not None else "-"
+    return f"{s['n']} ({s['wins']}W/{s['losses']}L/{s['scratches']}S, {wr}) ${s['pnl_usd']:+,.2f}"
+
+
+def filter_lines(ledger: Ledger, trades_doc: dict) -> list[str]:
+    fc = get_filter_cfg(trades_doc)
+    if not fc:
+        return []
+    since = parse_t(fc["enabled_at"]) if fc.get("enabled_at") else None
+    log = read_skip_log(ledger)
+    htf_blocked = [r for r in log if r.get("reason") == HTF_REASON]
+    L = [f"Entry filters (since {uae(since) if since else '-'}):"]
+    if fc.get("higher_tf_everywhere"):
+        L.append(f"  LIVE bigger chart must agree on every trade (75%+ exception included) · blocked so far: {len(htf_blocked)}")
+    L.append("  SHADOW (log only, trades unchanged) - closed W/L/S, win rate, P&L:")
+    tr = trades_doc["trades"]
+    for key, label in (("swing_probation", "Swing probation (would be half size)"),
+                       ("stretched_rsi", "Stretched RSI <75% (would skip)")):
+        tagged = [t for t in tr if any(x.get("filter") == key for x in (t.get("shadow") or []))]
+        cl = [t for t in tagged if t["status"] == "closed"]
+        op = sum(t["status"] == "open" for t in tagged)
+        sk = sum(any(x.get("filter") == key for x in (r.get("shadow") or [])) for r in log)
+        s = wls(cl)
+        extra = f" · if applied: ${s['pnl_usd'] / 2:+,.2f}" if key == "swing_probation" and cl else ""
+        L.append(f"  • {label}: closed {_wls_text(s)}{extra} · open {op} · tagged skipped signals {sk}")
+    new = [t for t in tr if t["status"] == "closed" and "btc_trend" in t]
+    if new:
+        by = {}
+        for t in new:
+            by.setdefault(f"BTC 1h {(t.get('btc_trend') or {}).get('1h') or '?'}", []).append(t)
+        L.append("  BTC trend at entry: " + " · ".join(f"{k} {_wls_text(wls(v))}" for k, v in sorted(by.items())))
+        mf = [t for t in new if t.get("mfe_r") is not None]
+        if mf:
+            L.append(f"  Avg excursion ({len(mf)} trades): best {sum(t['mfe_r'] for t in mf) / len(mf):+.2f}R, "
+                     f"worst {sum(t['mae_r'] for t in mf) / len(mf):+.2f}R")
+    sb = ledger._read(ledger.root / SHADOW_FILE, {"trades": []}).get("trades", [])
+    if sb:
+        L.append("  SHADOW TRADES (signals not opened, plain stop/target/time limit) - closed W/L/S, P&L · open:")
+        groups = {}
+        for t in sb:
+            k = t.get("shadow_reason") or "?"
+            k = k if t.get("shadow_stage") == "style_shadow" or k == HTF_REASON else "blocked: " + k.split(":")[0]
+            groups.setdefault(k, []).append(t)
+        for k, v in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+            cl = [t for t in v if t["status"] == "closed"]
+            L.append(f"  • {k}: {_wls_text(wls(cl))} · open {len(v) - len(cl)}")
+    n_closed = sum(t["status"] == "closed" for t in tr)
+    if fc.get("learning_freeze_until"):
+        L.append(f"  Learning filter: " + (f"FROZEN until {fc['learning_freeze_until']} closed trades ({n_closed} now) - "
+                                           f"recording only, never blocks" if n_closed < int(fc["learning_freeze_until"])
+                                           else "active"))
+    sty = fc.get("shadow_styles") or {}
+    if sty:
+        L.append("  Not opened as real trades: " + "; ".join(sty.values()))
+    closed = [t for t in tr if t["status"] == "closed"]
+    if closed:
+        by = {}
+        for t in closed:
+            by.setdefault(t.get("session") or "untagged", []).append(t)
+        L.append("  By session (all closed): " + " · ".join(f"{k} {_wls_text(wls(by[k]))}"
+                                                          for k in ("prime", "normal", "quiet", "untagged") if k in by))
     return L
 
 
@@ -1611,9 +2037,11 @@ def summary_text(ledger: Ledger, now=None) -> str:
     if ss:
         L += session_lines(ss) + [""]
     if tot["closed_trades"]:
+        wr = f"{tot['win_rate_pct']:.0f}%" if tot["win_rate_pct"] is not None else "-"
         L.append(f"Closed trades: {tot['closed_trades']} · won {tot['wins']} · lost {tot['losses']} · "
-                 f"win rate {tot['win_rate_pct']:.0f}% · total P&L ${tot['total_pnl_usd']:+,.2f} after costs "
-                 f"(avg {tot['avg_r']:+.2f}R)")
+                 f"scratch {tot['scratches']} (break-even, |P&L| < ${SCRATCH_USD:g}) · "
+                 f"win rate {wr} excl. scratches ({tot['win_rate_incl_scratches_pct']:.0f}% incl.) · "
+                 f"total P&L ${tot['total_pnl_usd']:+,.2f} after costs (avg {tot['avg_r']:+.2f}R)")
     else:
         L.append("Closed trades: none yet.")
     opens = [t for t in trades_doc["trades"] if t["status"] == "open"]
@@ -1632,6 +2060,8 @@ def summary_text(ledger: Ledger, now=None) -> str:
             mg += f" · {t['override']['note']}"
         if t.get("session"):
             mg += f" · {t['session']}"
+        if t.get("shadow_tags"):
+            mg += f" · shadow: {', '.join(t['shadow_tags'])}"
         L.append(f"  • {t['pair']} {t['style']} {t['side']} from {fmtp(t['entry'])} (stop {fmtp(t['stop'])}, "
                  f"target {fmtp(t['target'])}) · now {fmtp(t.get('last_price'))} · {u}{mg} · open {v['held']}, "
                  f"closes by {v['closes_by_uae']}")
@@ -1643,7 +2073,11 @@ def summary_text(ledger: Ledger, now=None) -> str:
             L.append(f"  • {t['pair']} {t['style']} {t['side']} {fmtp(t['entry'])} -> {fmtp(t['exit_price'])} "
                      f"{t['reason']}{' (half at target)' if t.get('partials') else ''} · ${t['pnl_usd']:+,.2f} ({t['pnl_pct_collateral']:+.1f}%) · held "
                      f"{dur(t['held_hours'])} · closed {uae(t['exit_time'])}"
+                     + (" · scratch" if outcome(t) == "scratch" else "")
                      + (f" · why: {', '.join(TAG_WORDS.get(x, x) for x in t['loss_tags'][:2])}" if t.get("loss_tags") else ""))
+    fl = filter_lines(ledger, trades_doc)
+    if fl:
+        L += [""] + fl
     L.append("")
     les = lessons(learning, trades_doc)
     L.append("What it has learned:" if les else "What it has learned: nothing yet (needs at least 5 closed trades in a group).")
@@ -1677,6 +2111,9 @@ def main(argv=None) -> int:
                          "let-winners-run (break-even at +1R, half at target, ATR trail) for this ledger")
     ap.add_argument("--enable-sessions", action="store_true",
                     help="switch on session rules (NY prime / normal / quiet, UAE time) and the high-confidence (75%%+) exception")
+    ap.add_argument("--enable-filters", action="store_true",
+                    help="switch on entry filters: bigger chart must agree on every trade (live), Swing-probation and "
+                         "stretched-RSI shadow tags (log only), BTC trend / excursion / scratch tracking")
     ap.add_argument("--override-min-confidence", type=float,
                     help="with --enable-sessions: confidence needed to open despite a pause (default 75)")
     ap.add_argument("--daily-goal", type=float, help="with --enable-protection: daily goal for the profit lock (USD)")
@@ -1704,6 +2141,14 @@ def main(argv=None) -> int:
         try:
             print(json.dumps(enable_sessions(led, override_min_confidence=a.override_min_confidence), indent=2,
                              default=str))
+        finally:
+            led.unlock()
+        if not (a.run or a.seed_from_state or a.summary or a.enable_filters):
+            return 0
+    if a.enable_filters:
+        led.lock()
+        try:
+            print(json.dumps(enable_filters(led), indent=2, default=str))
         finally:
             led.unlock()
         if not (a.run or a.seed_from_state or a.summary):

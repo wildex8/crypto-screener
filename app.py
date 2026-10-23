@@ -4,7 +4,7 @@ Leveraged Crypto Trade Screener
 
 A phone-friendly Streamlit app that:
   * downloads live candles for a crypto pair (with several data-source fallbacks),
-  * runs a style-weighted multi-timeframe analysis (Supertrend, EMAs, RSI, MACD, ADX, volume),
+  * runs a style-weighted multi-timeframe analysis (scored: Supertrend, EMA 21/50, RSI; shown: MACD, ADX, volume),
   * back-tests the same rules over roughly the last 12 months (costs and leverage included),
   * works out position size, liquidation price, stop, target and costs,
   * gives a big GO LONG / GO SHORT / NO-GO answer with a confidence %,
@@ -565,28 +565,22 @@ def add_indicators(df: pd.DataFrame, st_period: int = 10, st_mult: float = 3.0) 
 # =============================================================================
 # 4. SCORING AND MULTI-TIMEFRAME ANALYSIS
 # =============================================================================
-# Each timeframe gets a score between -100 (very bearish) and +100 (very bullish):
-#   Supertrend direction ............ +/-30  (the key verification indicator)
-#   EMA trend (3 checks x 10) ....... +/-30
-#   MACD histogram .................. +/-10
-#   RSI momentum .................... +/-10
-#   ADX trend strength (+DI vs -DI) . +/-10
-#   Volume surge with candle colour . +/-10
+# Each timeframe gets a score between -100 (very bearish) and +100 (very bullish).
+# Simplified 23 Oct 2026 (trend = Supertrend + ONE EMA check; MACD, ADX direction, the extra
+# EMA checks and the volume bonus were removed, the rest rescaled x2 so it still spans -100..+100):
+#   Supertrend direction ............ +/-60  (the key verification indicator)
+#   EMA 21 vs EMA 50 ................ +/-20
+#   RSI momentum .................... +/-20
+# MACD, ADX and relative volume are still computed and shown, but give no points.
 
 def score_components(d: pd.DataFrame) -> pd.DataFrame:
     """Vectorised score for every candle (used both live and in the backtest)."""
     c = d["close"]
     out = pd.DataFrame(index=d.index)
-    out["supertrend"] = 30 * d["st_dir"].astype(float)
-    long_ema = d["ema200"].where(d["ema200"].notna(), d["ema50"])
-    out["ema_long"] = 10 * np.sign(c - long_ema).fillna(0)
-    out["ema_fast"] = 10 * np.sign(d["ema9"] - d["ema21"]).fillna(0)
-    out["ema_mid"] = 10 * np.sign(d["ema21"] - d["ema50"]).fillna(0)
-    out["macd"] = 10 * np.sign(d["macd_hist"]).fillna(0)
+    out["supertrend"] = 60 * d["st_dir"].astype(float)
+    out["ema_mid"] = 20 * np.sign(d["ema21"] - d["ema50"]).fillna(0)
     r = d["rsi"]
-    out["rsi"] = np.select([(r > 55) & (r < 75), (r < 45) & (r > 25)], [10.0, -10.0], 0.0)
-    out["adx"] = np.where(d["adx"] >= 20, 10 * np.sign(d["plus_di"] - d["minus_di"]).fillna(0), 0.0)
-    out["volume"] = np.where(d["vol_ratio"] >= 1.2, 10 * np.sign(c - d["open"]), 0.0)
+    out["rsi"] = np.select([(r > 55) & (r < 75), (r < 45) & (r > 25)], [20.0, -20.0], 0.0)
     out["total"] = out.sum(axis=1).clip(-100, 100)
     return out
 
@@ -598,21 +592,12 @@ def _arrow(v):
 def explain_last(d: pd.DataFrame, comp: pd.DataFrame) -> list[dict]:
     """Plain-English explanation of each factor on the latest candle."""
     last, cl = d.iloc[-1], comp.iloc[-1]
-    long_name = "EMA 200" if pd.notna(last["ema200"]) else "EMA 50 (not enough data for EMA 200)"
     rows = [
         dict(factor="Supertrend", pts=cl["supertrend"],
              text="Price is above the Supertrend line - main trend is UP." if last["st_dir"] > 0
              else "Price is below the Supertrend line - main trend is DOWN."),
-        dict(factor=f"Price vs {long_name}", pts=cl["ema_long"],
-             text="Price is above the long-term average (bullish)." if cl["ema_long"] > 0
-             else "Price is below the long-term average (bearish)."),
-        dict(factor="EMA 9 vs 21", pts=cl["ema_fast"],
-             text="Short-term average is above the medium one (rising)." if cl["ema_fast"] > 0
-             else "Short-term average is below the medium one (falling)."),
         dict(factor="EMA 21 vs 50", pts=cl["ema_mid"],
              text="Medium-term trend is up." if cl["ema_mid"] > 0 else "Medium-term trend is down."),
-        dict(factor="MACD", pts=cl["macd"],
-             text="Momentum is pushing up." if cl["macd"] > 0 else "Momentum is pushing down."),
     ]
     r = last["rsi"]
     if r >= 75:
@@ -627,19 +612,12 @@ def explain_last(d: pd.DataFrame, comp: pd.DataFrame) -> list[dict]:
         rt = f"RSI {r:.0f}: neutral."
     rows.append(dict(factor="RSI (14)", pts=cl["rsi"], text=rt))
     a = last["adx"]
-    if pd.notna(a) and a >= 20:
-        at = f"ADX {a:.0f}: a real trend is present ({'buyers' if cl['adx'] > 0 else 'sellers'} in control)."
-    else:
-        at = f"ADX {a:.0f}: weak/choppy market - no points." if pd.notna(a) else "ADX: not enough data."
-    rows.append(dict(factor="ADX (trend strength)", pts=cl["adx"], text=at))
+    at = (f"ADX {a:.0f}: {'a real trend is present' if a >= 20 else 'weak/choppy market'} (info only, no points)."
+          if pd.notna(a) else "ADX: not enough data.")
+    rows.append(dict(factor="ADX (trend strength)", pts=0.0, text=at))
     vr = last["vol_ratio"]
-    if pd.isna(vr):
-        vt = "Volume: not enough data."
-    elif cl["volume"] != 0:
-        vt = f"Volume is {vr:.1f}x normal on a {'green' if cl['volume'] > 0 else 'red'} candle."
-    else:
-        vt = f"Volume is {vr:.1f}x normal - nothing special."
-    rows.append(dict(factor="Volume", pts=cl["volume"], text=vt))
+    vt = "Volume: not enough data." if pd.isna(vr) else f"Volume is {vr:.1f}x normal (info only, no points)."
+    rows.append(dict(factor="Volume", pts=0.0, text=vt))
     return rows
 
 
@@ -901,8 +879,7 @@ def decide(mtf: dict, style: str, leverage: float, position: dict, bt: dict | No
         if high["st_dir"] != direction and high["score"] * direction <= -40:
             blockers.append(f"Bigger {mtf['higher']} chart strongly points the other way.")
         elif high["st_dir"] != direction:
-            conf *= 0.85
-            reasons.append(f"⚠️ Bigger {mtf['higher']} Supertrend disagrees (confidence reduced).")
+            reasons.append(f"⚠️ Bigger {mtf['higher']} Supertrend disagrees (the practice bot does not trade this).")
         else:
             reasons.append(f"✅ Bigger {mtf['higher']} Supertrend agrees too.")
 
@@ -913,15 +890,16 @@ def decide(mtf: dict, style: str, leverage: float, position: dict, bt: dict | No
     if s is None:
         conf *= 0.8
         reasons.append("⚠️ Backtest could not run (confidence reduced).")
+    elif s["n"] < 10 and s["n"] > 0 and (s["exp_r"] < 0 or s["exp_pct"] < 0):
+        blockers.append(f"Past {word} trades lost money after costs ({s['exp_r']:+.2f}R, "
+                        f"{s['exp_pct']:+.2f}% per trade, only {s['n']} trades).")
     elif s["n"] < 10:
-        conf *= 0.85 if s["exp_r"] > 0 else 0.7
-        reasons.append(f"⚠️ Backtest had only {s['n']} {word} trades - low reliability.")
+        reasons.append(f"⚠️ Backtest had only {s['n']} {word} trades - low reliability (no confidence cut).")
     elif s["exp_r"] <= 0 or s["exp_pct"] <= 0 or (bt or {}).get("wiped"):
         blockers.append(f"Past {word} trades lost money after costs ({s['exp_r']:+.2f}R, "
                         f"{s['exp_pct']:+.2f}% per trade, {s['n']} trades).")
     elif s["exp_r"] < 0.1:
-        conf *= 0.85
-        reasons.append(f"⚠️ Past {word} trades only just made money ({s['exp_r']:+.2f}R) - confidence reduced.")
+        reasons.append(f"⚠️ Past {word} trades only just made money ({s['exp_r']:+.2f}R).")
     else:
         if s["exp_r"] >= 0.25 and s["pf"] > 1.3:
             conf *= 1.05
