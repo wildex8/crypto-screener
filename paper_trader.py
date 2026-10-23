@@ -97,11 +97,11 @@ behave exactly as before):
     adverse excursion (mfe_usd / mae_usd / mfe_r / mae_r). Closed trades with |P&L| < $1 count as
     "scratch" (not a win or a loss); win rate = wins / (wins + losses).
 
-  - CLEANUP (23 Oct 2026, same switch): ONE minimum confidence of 55% for every style and session
-    (rules.sessions keeps the old 55/65/70 values, overlaid at run time); the 15m slow-hours windows and
-    the NY-open-candle skip are frozen (code kept); the 75%+ exception keeps its full-size override of
-    the profit lock / 6-trade cap / prime slots but no longer opens a half-size trade during a daily-loss
-    pause (daily loss limit is absolute). Learning filter frozen (records stats and what it would have
+  - CLEANUP (23 Oct 2026, same switch): ONE minimum confidence of 55% for every style in prime and
+    normal hours; quiet hours keep 70% (rules.sessions keeps the stored values, overlaid at run time);
+    the 15m slow-hours windows and the NY-open-candle skip are frozen (code kept); the 75%+ exception is
+    PAUSED (code kept, exception_paused) until the confidence score is recalibrated at ~60 trades, and
+    when it returns it no longer opens a half-size trade during a daily-loss pause. Learning filter frozen (records stats and what it would have
     done, never blocks or adds penalties) until 100 closed trades. No new real Scalp-1h trades (merged
     into Day) or Swing trades (shadow mode); open ones run on unchanged. Signals that do not open become
     hypothetical shadow trades (shadow_trades.json: plain stop / target / time limit, same costs).
@@ -187,6 +187,7 @@ DEFAULT_FILTERS = dict(
     freeze_scalp15_windows=True,        # 15m slow-hours 65% rule frozen (code kept)
     freeze_ny_candle_skip=True,         # NY-open-candle skip frozen (code kept)
     exception_half_size=False,          # no half-size 75%+ trade during a daily-loss pause (limit is absolute)
+    exception_paused=True,              # 75%+ exception PAUSED (code kept) until the score is recalibrated (~60 trades)
     learning_freeze_until=100,          # learning records only (no new penalties/blocks, not enforced) until N closed
     shadow_styles={"Scalp-1h": "Scalp-1h merged into Day (shadow only)", "Swing": "Swing in shadow mode"},
     shadow_trades=True, shadow_max_open=40, open_interest=True)
@@ -1283,8 +1284,8 @@ def _session_overlay(c: dict, f: dict | None) -> dict:
     c = dict(c)
     if f.get("single_min_conf") is not None:
         c.update(single_min_conf=f["single_min_conf"], prime_conf=f["single_min_conf"],
-                 normal_conf=f["single_min_conf"], quiet_conf=f["single_min_conf"],
-                 scalp15_strict_conf=f["single_min_conf"])
+                 normal_conf=f["single_min_conf"], scalp15_strict_conf=f["single_min_conf"])
+        # quiet hours keep their own bar (70%): 55% in quiet hours lost money in the replay
     if f.get("higher_tf_everywhere"):
         c["quiet_need_higher_tf"] = False          # covered by the every-trade rule
     if f.get("freeze_scalp15_windows"):
@@ -1307,6 +1308,8 @@ def get_override_cfg(trades_doc) -> dict | None:
     f = get_filter_cfg(trades_doc)
     if f and not f.get("exception_half_size", True):
         c["half_size"] = []                       # daily loss limit is absolute
+    if f and f.get("exception_paused"):
+        c["paused"] = True                        # never overrides anything while paused
     return c
 
 
@@ -1342,7 +1345,9 @@ def next_prime(now: datetime, cfg: dict):
 def session_min_conf(style: str, sess: dict, now: datetime, cfg: dict):
     """(minimum confidence, needs higher-timeframe agreement, label) for this style now."""
     if cfg.get("single_min_conf") is not None:
-        return cfg["single_min_conf"], bool(sess["name"] == "quiet" and cfg["quiet_need_higher_tf"]), "minimum"
+        if sess["name"] == "quiet":
+            return cfg["quiet_conf"], bool(cfg["quiet_need_higher_tf"]), "quiet hours"
+        return cfg["single_min_conf"], False, "minimum"
     if sess["name"] == "prime":
         return cfg["prime_conf"], False, "NY prime"
     if sess["name"] == "quiet":
@@ -1410,7 +1415,8 @@ def session_state(trades_doc, now) -> dict | None:
     if oc:
         day0 = now.astimezone(app.LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
         used = _half_overrides_today(trades_doc, day0)
-        out["high_conf_override"] = dict(min_confidence=oc["override_min_confidence"], full_size_despite=oc["full_size"],
+        out["high_conf_override"] = dict(min_confidence=oc["override_min_confidence"], paused=bool(oc.get("paused")),
+                                         full_size_despite=oc["full_size"],
                                          half_size_despite=oc["half_size"],
                                          half_size_left_today=max(int(oc["half_size_per_day"]) - used, 0),
                                          never_despite=["weekly", "quiet_cap"]
@@ -1463,7 +1469,7 @@ def gate_new_trade(trades_doc: dict, sig: dict, feats: dict, now: datetime) -> d
     pauses.sort(key=lambda b: PAUSE_ORDER.index(b["rule"]) if b["rule"] in PAUSE_ORDER else 99)
     res["all_reasons"] = [b["reason"] for b in pauses]
     allowed_rules = set((ocfg or {}).get("full_size", [])) | set((ocfg or {}).get("half_size", []))
-    high = bool(ocfg) and conf >= ocfg["override_min_confidence"]
+    high = bool(ocfg) and not ocfg.get("paused") and conf >= ocfg["override_min_confidence"]
     if pauses:
         hard = [b for b in pauses if not high or b["rule"] not in allowed_rules]
         if hard:
@@ -1935,7 +1941,12 @@ def session_lines(ss: dict) -> list[str]:
     if ss.get("next_prime_uae"):
         L.append(f"  {'Prime now, until' if ss['in_prime_now'] else 'Next prime'}: {ss['next_prime_uae']['text']}")
     o = ss.get("high_conf_override")
-    if o:
+    if o and o.get("paused"):
+        L.append(f"  {o['min_confidence']:g}%+ exception: PAUSED (code kept) until the confidence score is recalibrated "
+                 f"(~60 trades) - every limit, cap and reserved slot applies to every signal")
+        if ss.get("frozen"):
+            L.append("  Frozen (code kept, not applied): " + "; ".join(ss["frozen"]))
+    elif o:
         half = (f"; half size despite the daily loss limit ({o['half_size_left_today']} left today)"
                 if o["half_size_despite"] else "")
         nev = ["the weekly limit"] + (["the daily loss limit"] if "daily_loss" in o["never_despite"] else []) \

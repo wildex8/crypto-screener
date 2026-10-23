@@ -252,13 +252,13 @@ Switched on per ledger with `python paper_trader.py --enable-sessions [--overrid
 Switched on with `python paper_trader.py --enable-filters` (stored under `rules.entry_filters`; it overrides the session values above at run time without changing them):
 
 - **Bigger chart must agree on every new trade.** This applies to every style and session, and the 75%+ exception can't bypass it. A blocked trade shows the reason `bigger chart disagrees`.
-- **One 55% minimum everywhere.** The 65% rule for 15m scalps at set hours and the NY-open-candle skip are frozen. Their code is kept but not applied.
-- **75%+ exception:** full size despite the profit lock, the 6-trade cap or the prime slots. The half-size trade during a daily-loss pause is gone, so the daily loss limit is absolute.
+- **55% minimum in prime and normal hours, 70% in quiet hours.** The 65% rule for 15m scalps at set hours and the NY-open-candle skip are frozen. Their code is kept but not applied.
+- **75%+ exception paused** (code kept) until the confidence score is recalibrated at about 60 trades. Every limit, cap and reserved slot applies to every signal. When it returns, it will have no half-size trade during a daily-loss pause, so the daily loss limit stays absolute.
 - **Learning filter frozen** until 100 closed trades. It keeps recording but never blocks or adds penalties.
 - **No new real Scalp-1h trades** (Day covers 1h) **or Swing trades** (shadow mode). Open ones keep running.
 - **Shadow (log only):** "would be half size: Swing probation" and "would skip: stretched RSI" tags. Every signal that does not open becomes a hypothetical trade in `shadow_trades.json` (plain stop / target / time limit). It is also logged to `skipped_signals.jsonl` with relative volume, funding, OKX open interest, BTC 1h/4h trend, RSI and session.
 - **Tracking:** a close with |P&L| under $1 counts as a scratch, not a win or a loss, and win rate = wins / (wins + losses). New trades also store BTC trend, session and max favourable/adverse excursion.
-- **Confidence score (app):** Supertrend ±60, EMA 21 vs 50 ±20 and RSI ±20. MACD, ADX, the other EMA checks and volume are shown but score nothing. There is no confidence cut for a thin backtest or for a disagreeing bigger chart. A backtest that lost money still blocks.
+- **Confidence score (app):** Supertrend ±60, EMA 21 vs 50 ±20 and RSI ±20. Confidence = 40 + 0.35 × the aligned score (was 0.55), so a fully aligned setup is about 75%, 55% needs a score of about +44 and 70% about +86. MACD, ADX, the other EMA checks and volume are shown but score nothing. There is no confidence cut for a thin backtest or for a disagreeing bigger chart. A backtest that lost money still blocks.
 
 The ledger lives in `/workspace/scanner/paper/` on Grok Bot's computer (`trades.json`, `learning.json`, with backups before every write).
 

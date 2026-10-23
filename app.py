@@ -845,6 +845,12 @@ def side_stats(trades: pd.DataFrame | None) -> dict:
                 avg_loss=float(lo["ret"].mean() * 100) if len(lo) else 0.0)
 
 
+# Confidence = 40 + CONF_PER_POINT x the aligned score (-100..+100). 0.35 since the 23 Oct 2026 score
+# simplification (was 0.55): a fully aligned setup is ~75%, so the 55% GO minimum needs a score of
+# about +44 and 70% (quiet hours in the practice bot) about +86.
+CONF_PER_POINT = 0.35
+
+
 def decide(mtf: dict, style: str, leverage: float, position: dict, bt: dict | None,
            learn_mult: float, direction: int = 1) -> dict:
     """Evaluate ONE side (direction +1 = LONG, -1 = SHORT) and return its
@@ -860,7 +866,7 @@ def decide(mtf: dict, style: str, leverage: float, position: dict, bt: dict | No
     reasons, blockers = [], []
     prim, high = mtf["tfs"][mtf["primary"]], mtf["tfs"].get(mtf["higher"])
 
-    conf = min(92.0, max(1.0, 40 + aligned * 0.55))
+    conf = min(92.0, max(1.0, 40 + aligned * CONF_PER_POINT))
     if aligned > 0:
         reasons.append(f"Charts lean towards a {word} (score {score:+.0f} out of 100).")
     if aligned < cfg["min_score"]:
